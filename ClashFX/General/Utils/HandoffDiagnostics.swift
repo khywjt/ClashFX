@@ -15,7 +15,7 @@ final class HandoffTimeline {
          emit: @escaping (String) -> Void) {
         self.transactionID = transactionID
         self.now = now
-        self.started = now()
+        started = now()
         self.emit = emit
     }
 
@@ -71,7 +71,9 @@ enum PortListenProbe {
                 Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
             }
         }
-        if result == 0 { return true }
+        if result == 0 {
+            return true
+        }
         guard errno == EINPROGRESS else { return false }
         var descriptor = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
         guard poll(&descriptor, 1, Int32(timeout * 1000)) > 0 else { return false }
@@ -90,7 +92,9 @@ enum PortListenProbe {
         for offset in offsets {
             let target = start + UInt64(offset * 1_000_000_000)
             let current = DispatchTime.now().uptimeNanoseconds
-            if target > current { usleep(UInt32((target - current) / 1000)) }
+            if target > current {
+                usleep(UInt32((target - current) / 1000))
+            }
             let elapsedMs = (DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
             for port in ports {
                 emit("listener_probe port=\(port) t+\(elapsedMs)ms accepting=\(isAccepting(port: port))")

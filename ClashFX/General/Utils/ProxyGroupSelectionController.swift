@@ -3,6 +3,7 @@ import AppKit
 /// Owns the user initiated selection flow for one proxy group. Core snapshots
 /// remain the only source of checkmark state.
 final class ProxyGroupSelectionController: NSObject, NSMenuItemValidation {
+    static let manualSelectionWillBegin = Notification.Name("ClashFX.manualProxySelectionWillBegin")
     private static let registry = NSHashTable<ProxyGroupSelectionController>.weakObjects()
     /// A menu rebuild can release the old submenu while its PUT is still in
     /// flight. Keep that controller alive until its callback or timeout settles
@@ -82,6 +83,7 @@ final class ProxyGroupSelectionController: NSObject, NSMenuItemValidation {
     }
 
     private enum Stage: Equatable {
+        case preflight
         case mutating
         case readback
     }
@@ -103,6 +105,9 @@ final class ProxyGroupSelectionController: NSObject, NSMenuItemValidation {
     private var activeOperation: Operation?
     private var activeStageID: UUID?
     private var activeStageSettlement: ManagedOperationSettlement<StageOutcome>?
+    private var automaticValidation: ((ClashProxyResp) -> Bool)?
+    private var automaticTopologyValidation: ((ClashProxyResp) -> Bool)?
+    private var automaticCompletion: ((Bool) -> Void)?
     private var candidateItems = [String: ProxyMenuItem]()
     private(set) var proxyGroup: ClashProxy
     private(set) var proxySnapshot: ClashProxyResp
@@ -191,7 +196,33 @@ final class ProxyGroupSelectionController: NSObject, NSMenuItemValidation {
             return
         }
 
+        NotificationCenter.default.post(name: Self.manualSelectionWillBegin, object: nil,
+                                        userInfo: ["group": groupName, "name": name])
         begin(.select(name))
+    }
+
+    /// The automatic flow owns the same global lease as menu selections. It
+    /// adds a fresh preflight under that lease and never closes connections.
+    func selectAutomatically(name: String, expectedSelection: String,
+                             validateSnapshot: @escaping (ClashProxyResp) -> Bool,
+                             completion: @escaping (Bool) -> Void) {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard canRunRequest(), groupType == .select, members.contains(name),
+              isSelectableCandidate(name), name != expectedSelection else {
+            completion(false)
+            return
+        }
+        automaticValidation = { [groupName] snapshot in
+            snapshot.proxiesMap[groupName]?.now == expectedSelection && validateSnapshot(snapshot)
+        }
+        automaticTopologyValidation = validateSnapshot
+        automaticCompletion = completion
+        let operation = Operation(id: UUID(), controllerGeneration: controllerGeneration,
+                                  intent: .select(name), stage: .preflight)
+        activeOperation = operation
+        Self.activeOperationOwners[operation.id] = self
+        Self.refreshSharedInteractionState()
+        startReadback(operation: operation)
     }
 
     @objc func restoreAutomaticSelection(sender: NSMenuItem) {
@@ -211,6 +242,8 @@ final class ProxyGroupSelectionController: NSObject, NSMenuItemValidation {
             reportError(manualPriorityUnavailableMessage)
             return
         }
+        NotificationCenter.default.post(name: Self.manualSelectionWillBegin, object: nil,
+                                        userInfo: ["group": groupName])
         begin(.reset)
     }
 
@@ -381,7 +414,7 @@ final class ProxyGroupSelectionController: NSObject, NSMenuItemValidation {
             operation.stage = .readback
             activeOperation = operation
             startReadback(operation: operation)
-        case .readback:
+        case .preflight, .readback:
             assertionFailure("Readback stages are settled through readbackDidSettle")
         }
     }
@@ -411,7 +444,7 @@ final class ProxyGroupSelectionController: NSObject, NSMenuItemValidation {
         guard activeStageID == stageID,
               let operation = activeOperation,
               operation.id == operationID,
-              operation.stage == .readback else { return }
+              operation.stage == .readback || operation.stage == .preflight else { return }
         activeStageID = nil
         readbackSettlement = nil
 
@@ -434,12 +467,39 @@ final class ProxyGroupSelectionController: NSObject, NSMenuItemValidation {
             // The GET belongs to the still-current config/core scope, but this
             // controller no longer owns that group identity. Publish the live
             // topology so the replacement menu can render its authority.
-            dependencies.publish(snapshot)
+            if automaticCompletion == nil { dependencies.publish(snapshot) }
             if activeOperation?.id == operationID {
                 invalidate()
                 finishFailure(operationID: operationID, message: "Selected path unavailable")
             }
             return
+        }
+
+        if operation.stage == .preflight {
+            guard automaticValidation?(snapshot) == true,
+                  !dependencies.isBusyBenchmark(), !dependencies.isInteractionReserved() else {
+                finishFailure(operationID: operationID, message: "Selected path unavailable")
+                return
+            }
+            proxySnapshot = snapshot
+            proxyGroup = refreshedGroup
+            var mutation = operation
+            mutation.stage = .mutating
+            activeOperation = mutation
+            startStage(operation: mutation) { [dependencies, groupName] complete in
+                if case let .select(name) = mutation.intent {
+                    dependencies.select(groupName, name, complete)
+                }
+            }
+            return
+        }
+
+        if automaticCompletion != nil {
+            guard automaticTopologyValidation?(snapshot) == true,
+                  intentMatches(operation.intent, group: refreshedGroup) else {
+                finishFailure(operationID: operationID, message: "Selected path unavailable")
+                return
+            }
         }
 
         // Every valid current-scope GET is published, even when Mihomo did not
@@ -470,13 +530,22 @@ final class ProxyGroupSelectionController: NSObject, NSMenuItemValidation {
         if case let .select(name) = operation.intent, groupType == .select {
             dependencies.rememberSelection(groupName, name)
         }
-        dependencies.closeConnections()
+        if let completion = automaticCompletion {
+            automaticCompletion = nil
+            automaticValidation = nil
+            automaticTopologyValidation = nil
+            completion(true)
+        } else {
+            dependencies.closeConnections()
+        }
     }
 
     private func intentMatches(_ intent: Intent, group: ClashProxy) -> Bool {
         switch intent {
         case let .select(name):
-            if groupType == .select { return group.now == name }
+            if groupType == .select {
+                return group.now == name
+            }
             return group.supportsManualPriority && group.fixed == name
         case .reset:
             return group.supportsManualPriority && group.fixed == ""
@@ -528,7 +597,9 @@ final class ProxyGroupSelectionController: NSObject, NSMenuItemValidation {
 
     private func canSelect(_ name: String) -> Bool {
         guard members.contains(name), isSelectableCandidate(name), canRunRequest() else { return false }
-        if groupType == .select { return proxyGroup.type == .select }
+        if groupType == .select {
+            return proxyGroup.type == .select
+        }
         return proxyGroup.supportsManualPriority && proxyGroup.fixed != nil
     }
 
@@ -557,7 +628,14 @@ final class ProxyGroupSelectionController: NSObject, NSMenuItemValidation {
         Self.activeOperationOwners.removeValue(forKey: operationID)
         updateMenuPresentation()
         Self.refreshSharedInteractionState()
-        reportError(message)
+        if let completion = automaticCompletion {
+            automaticCompletion = nil
+            automaticValidation = nil
+            automaticTopologyValidation = nil
+            completion(false)
+        } else {
+            reportError(message)
+        }
     }
 
     private func validate(group: ClashProxy, snapshot: ClashProxyResp) -> Bool {

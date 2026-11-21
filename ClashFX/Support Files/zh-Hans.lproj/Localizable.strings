@@ -955,3 +955,8 @@
 "Retry" = "重试";
 "Quit Anyway" = "仍然退出";
 "Keep ClashFX Open" = "保持 ClashFX 运行";
+
+/* AI selector reachability supervision */
+"AI Node Automatic Failover" = "AI 节点自动切换";
+"Enable AI Node Automatic Failover" = "启用 AI 节点自动切换";
+"Resume AI Node Automatic Failover" = "恢复 AI 节点自动切换";

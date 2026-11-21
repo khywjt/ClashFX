@@ -442,7 +442,9 @@ class ApiRequest {
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: timeout)
         request.httpMethod = method
         request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
-        if !context.secret.isEmpty { request.setValue("Bearer " + context.secret, forHTTPHeaderField: "Authorization") }
+        if !context.secret.isEmpty {
+            request.setValue("Bearer " + context.secret, forHTTPHeaderField: "Authorization")
+        }
         if let body {
             request.httpBody = try? JSONSerialization.data(withJSONObject: body)
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -977,13 +979,18 @@ class ApiRequest {
             }
     }
 
-    static func updateProxyGroup(group: String, selectProxy: String, callback: @escaping ((Bool) -> Void)) {
-        req("/proxies/\(group.encoded)",
+    static func updateProxyGroup(group: String, selectProxy: String, session: BenchmarkSession? = nil,
+                                  callback: @escaping ((Bool) -> Void)) {
+        guard session?.isCancelled != true else { callback(false); return }
+        let request = req("/proxies/\(group.encoded)",
             method: .put,
             parameters: ["name": selectProxy],
             encoding: JSONEncoding.default,
             timeoutInterval: 10)
-            .responseData { response in
+        let requestID = session?.track(request)
+        request.responseData { response in
+                if let requestID { session?.finish(requestID) }
+                guard session?.isCancelled != true else { callback(false); return }
                 let statusCode = response.response?.statusCode ?? -1
                 let success = statusCode == 204
                 if success {
@@ -1191,6 +1198,50 @@ class ApiRequest {
                              timeout: timeout, session: session) { callback($0.delay ?? 0) }
     }
 
+    private struct AIFailoverScope: Hashable {
+        let core: BenchmarkProbeCoreScope
+        let secret: String
+        let direct: Bool
+    }
+
+    /// Opaque equality token only; never log it or persist controller secrets.
+    static func currentAIFailoverScope() -> AnyHashable {
+        AnyHashable(AIFailoverScope(
+            core: currentBenchmarkProbeCoreScope(),
+            secret: ConfigManager.shared.overrideSecret ?? ConfigManager.shared.apiSecret,
+            direct: useDirectApi()
+        ))
+    }
+
+    /// Quiet HEAD reachability via the named leaf. Mihomo v1.19.24 accepts
+    /// every HTTP status when `expected` is omitted: 401/403/429 are reachable.
+    /// This deliberately avoids the interactive benchmark diagnostic/cache store.
+    static func getAIFailoverReachability(proxyName: String, url: String,
+                                          session: BenchmarkSession,
+                                          callback: @escaping (AIFailoverSupervisor.Reachability) -> Void) {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard !session.isCancelled,
+              session.probeCoreScope == currentBenchmarkProbeCoreScope() else {
+            callback(.unknown)
+            return
+        }
+        let scope = currentAIFailoverScope()
+        let request = req("/proxies/\(proxyName.encoded)/delay", parameters: ["timeout": 5000, "url": url],
+                          timeoutInterval: 7)
+        let id = session.track(request)
+        request.responseData { response in
+            session.finish(id)
+            guard !session.isCancelled, scope == currentAIFailoverScope() else {
+                callback(.unknown)
+                return
+            }
+            callback(AIFailoverSupervisor.Reachability(ProxyDelayOutcome.decode(
+                statusCode: response.response?.statusCode,
+                data: response.data, transportFailed: response.error != nil
+            )))
+        }
+    }
+
     static func getProxyDelayOutcome(proxyName: String,
                                      benchmarkURL: String,
                                      timeout: Int,
@@ -1287,6 +1338,7 @@ class ApiRequest {
 
     /// Fetches one current `/proxies` topology without the normal cached-response fallback.
     static func getFreshProxyGroupList(session: BenchmarkSession,
+                                       quiet: Bool = false,
                                        callback: @escaping (ClashProxyResp?) -> Void) {
         guard !session.isCancelled else {
             callback(nil)
@@ -1311,10 +1363,10 @@ class ApiRequest {
                   let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   root["proxies"] is [String: Any]
             else {
-                Logger.log(
+                if !quiet { Logger.log(
                     "[Proxy Delay] Fresh proxy topology unavailable, status: \(statusCode), error: \(response.error?.localizedDescription ?? "unknown error")",
                     level: .warning
-                )
+                ) }
                 callback(nil)
                 return
             }
@@ -2096,12 +2148,18 @@ extension ApiRequest: WebSocketDelegate {
             self.trafficWebSocketRetryTimer = Timer.scheduledTimer(
                 withTimeInterval: self.trafficWebSocketRetryDelay, repeats: false
             ) { [weak self] _ in
-                if self?.trafficWebSocketIsConnected == true { return }
+                if self?.trafficWebSocketIsConnected == true {
+                    return
+                }
                 self?.requestTrafficInfo()
             }
             self.trafficWebSocketRetryDelay = min(self.trafficWebSocketRetryDelay * 2, Self.maxRetryDelaySeconds)
         }
-        if Thread.isMainThread { arm() } else { DispatchQueue.main.async(execute: arm) }
+        if Thread.isMainThread {
+            arm()
+        } else {
+            DispatchQueue.main.async(execute: arm)
+        }
     }
 
     private func scheduleLogRetry() {
@@ -2111,12 +2169,18 @@ extension ApiRequest: WebSocketDelegate {
             self.loggingWebSocketRetryTimer = Timer.scheduledTimer(
                 withTimeInterval: self.loggingWebSocketRetryDelay, repeats: false
             ) { [weak self] _ in
-                if self?.loggingWebSocketIsConnected == true { return }
+                if self?.loggingWebSocketIsConnected == true {
+                    return
+                }
                 self?.requestLog()
             }
             self.loggingWebSocketRetryDelay = min(self.loggingWebSocketRetryDelay * 2, Self.maxRetryDelaySeconds)
         }
-        if Thread.isMainThread { arm() } else { DispatchQueue.main.async(execute: arm) }
+        if Thread.isMainThread {
+            arm()
+        } else {
+            DispatchQueue.main.async(execute: arm)
+        }
     }
 
     private func armTrafficWatchdog() {

@@ -914,3 +914,8 @@
 "Retry" = "重試";
 "Quit Anyway" = "仍然結束";
 "Keep ClashFX Open" = "保持 ClashFX 執行";
+
+/* AI selector reachability supervision */
+"AI Node Automatic Failover" = "AI 節點自動切換";
+"Enable AI Node Automatic Failover" = "啟用 AI 節點自動切換";
+"Resume AI Node Automatic Failover" = "恢復 AI 節點自動切換";

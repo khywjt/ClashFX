@@ -29,7 +29,9 @@ class MenuItemFactory {
     static func recreateProxyMenuItems(coreReloaded: Bool = false) {
         let recreate = {
             advanceSelectionControllerGeneration()
-            if coreReloaded { BenchmarkProbeDiagnosticsStore.clearAll() }
+            if coreReloaded {
+                BenchmarkProbeDiagnosticsStore.clearAll()
+            }
             // A mode change or reload of the same profile is not a new
             // benchmark scope. Validate retained evidence against the snapshot
             // below; changing profiles/controllers must clear every store.
@@ -47,7 +49,11 @@ class MenuItemFactory {
             }
             scheduleRefresh(.rebuild)
         }
-        if Thread.isMainThread { recreate() } else { DispatchQueue.main.async(execute: recreate) }
+        if Thread.isMainThread {
+            recreate()
+        } else {
+            DispatchQueue.main.async(execute: recreate)
+        }
     }
 
     private static func scheduleRefresh(_ mode: ProxyMenuRefreshCoordinator.Mode) {
@@ -55,7 +61,11 @@ class MenuItemFactory {
             guard let ticket = refreshCoordinator.request(mode) else { return }
             executeRefresh(ticket)
         }
-        if Thread.isMainThread { schedule() } else { DispatchQueue.main.async(execute: schedule) }
+        if Thread.isMainThread {
+            schedule()
+        } else {
+            DispatchQueue.main.async(execute: schedule)
+        }
     }
 
     private static func executeRefresh(_ ticket: ProxyMenuRefreshCoordinator.Ticket) {
@@ -71,7 +81,7 @@ class MenuItemFactory {
         }
     }
 
-    private static func applyRefreshResult(
+    static func applyRefreshResult(
         _ info: ClashProxyResp?,
         mode: ProxyMenuRefreshCoordinator.Mode
     ) {
@@ -119,6 +129,7 @@ class MenuItemFactory {
         advanceSelectionControllerGeneration()
         var menuItems = [NSMenuItem]()
         let visibleGroups = proxyInfo.proxyGroups.filter { !($0.hidden ?? false) }
+        var addedAIFailoverMenu = false
         for proxy in sortedProxyGroupsForMenu(visibleGroups) {
             var menu: NSMenuItem?
             switch proxy.type {
@@ -134,7 +145,14 @@ class MenuItemFactory {
             if let menu = menu {
                 menuItems.append(menu)
                 menu.isEnabled = true
+                if proxy.name == AIFailoverTopology.group, let controls = AIFailoverMenuIntegration.makeMenuItem?() {
+                    menuItems.append(controls)
+                    addedAIFailoverMenu = true
+                }
             }
+        }
+        if !addedAIFailoverMenu, let controls = AIFailoverMenuIntegration.makeMenuItem?() {
+            menuItems.append(controls)
         }
         updateProxyList(withMenus: Array(menuItems.reversed()))
     }
@@ -229,7 +247,9 @@ class MenuItemFactory {
                                                  leftPadding: Bool) -> NSMenuItem? {
         let isGlobalMode = ConfigManager.shared.currentConfig?.mode == .global
         if !isGlobalMode {
-            if proxyGroup.name == "GLOBAL" { return nil }
+            if proxyGroup.name == "GLOBAL" {
+                return nil
+            }
         }
 
         let menu = NSMenuItem(title: proxyGroup.name, action: nil, keyEquivalent: "")
@@ -378,9 +398,7 @@ class MenuItemFactory {
                     applyRefreshResult(freshSnapshot, mode: .incremental)
                 },
                 rememberSelection: { groupName, name in
-                    let model = SavedProxyModel(group: groupName, selected: name, config: configName)
-                    ConfigManager.selectedProxyRecords.removeAll { $0.key == model.key }
-                    ConfigManager.selectedProxyRecords.append(model)
+                    rememberSelection(group: groupName, name: name, configName: configName)
                 },
                 closeConnections: {
                     ConnectionManager.closeAllConnection()
@@ -396,6 +414,12 @@ class MenuItemFactory {
                 stageTimeout: 10
             )
         )
+    }
+
+    static func rememberSelection(group: String, name: String, configName: String) {
+        let model = SavedProxyModel(group: group, selected: name, config: configName)
+        ConfigManager.selectedProxyRecords.removeAll { $0.key == model.key }
+        ConfigManager.selectedProxyRecords.append(model)
     }
 
     @discardableResult

@@ -917,3 +917,8 @@
 "Retry" = "Retry";
 "Quit Anyway" = "Quit Anyway";
 "Keep ClashFX Open" = "Keep ClashFX Open";
+
+/* AI selector reachability supervision */
+"AI Node Automatic Failover" = "AI Node Automatic Failover";
+"Enable AI Node Automatic Failover" = "Enable AI Node Automatic Failover";
+"Resume AI Node Automatic Failover" = "Resume AI Node Automatic Failover";

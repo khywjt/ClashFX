@@ -134,7 +134,9 @@ enum ClaudeProxyLockPolicy {
         var completed = Set<String>()
 
         func visit(_ name: String, referencedBy parent: String?) -> String? {
-            if name == "DIRECT" || name == "REJECT" || completed.contains(name) { return nil }
+            if name == "DIRECT" || name == "REJECT" || completed.contains(name) {
+                return nil
+            }
             if graph.ambiguousNames.contains(name) {
                 return "The name \"\(name)\" is defined more than once, so its dependencies are ambiguous."
             }
@@ -170,7 +172,9 @@ enum ClaudeProxyLockPolicy {
                     }
                 }
             }
-            if reason == nil { completed.insert(name) }
+            if reason == nil {
+                completed.insert(name)
+            }
             return reason
         }
 
@@ -207,6 +211,12 @@ enum ClaudeProxyLockPolicy {
             "DOMAIN-SUFFIX,\($0),\(trimmed)"
         }
         return [processRule] + domainRules
+    }
+
+    /// Read-only check: the fixed target and all dialer dependencies avoid this group.
+    static func isIndependent(target: String, of group: String, in root: [String: Any],
+                              providers: [ProviderSnapshot] = []) -> Bool {
+        dependencyGraph(in: root, providers: providers).isSafe(from: target, avoiding: group)
     }
 
     /// The group selected by MATCH, when every possible dependency is resolvable and safe.
@@ -645,14 +655,18 @@ enum ClaudeProxyLockPolicy {
         let rawFilter: String?
         if let value = definition?["filter"] {
             rawFilter = value as? String
-            if rawFilter == nil { known = false }
+            if rawFilter == nil {
+                known = false
+            }
         } else {
             rawFilter = nil
         }
         let rawExcludeFilter: String?
         if let value = definition?["exclude-filter"] {
             rawExcludeFilter = value as? String
-            if rawExcludeFilter == nil { known = false }
+            if rawExcludeFilter == nil {
+                known = false
+            }
         } else {
             rawExcludeFilter = nil
         }
@@ -660,7 +674,9 @@ enum ClaudeProxyLockPolicy {
         let rawExcludeType: String?
         if let raw = definition?["exclude-type"] {
             rawExcludeType = raw as? String
-            if rawExcludeType == nil { known = false }
+            if rawExcludeType == nil {
+                known = false
+            }
         } else {
             rawExcludeType = nil
         }
@@ -691,7 +707,9 @@ enum ClaudeProxyLockPolicy {
                 known = false
                 continue
             }
-            if !included { continue }
+            if !included {
+                continue
+            }
 
             guard let effectiveName = providerProxyName(rawName, override: override) else {
                 known = false
@@ -708,7 +726,9 @@ enum ClaudeProxyLockPolicy {
                 continue
             }
             seenNames[effectiveName] = (rawName, fingerprint)
-            if fingerprint == nil { known = false }
+            if fingerprint == nil {
+                known = false
+            }
 
             let rawProxyDialer: String?
             var proxyHasInvalidDialer = false

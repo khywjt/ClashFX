@@ -17,8 +17,10 @@ final class RuntimeConfigValidationRunner {
     private let binary: URL
     private let resourceDirectory: URL
     private let timeout: TimeInterval
+    private let diagnostic: (String) -> Void
 
-    init(binary: URL, resourceDirectory: URL, timeout: TimeInterval = 10) {
+    init(binary: URL, resourceDirectory: URL, timeout: TimeInterval = 10, diagnostic: @escaping (String) -> Void = { _ in }) {
+        self.diagnostic = diagnostic
         self.binary = binary
         self.resourceDirectory = resourceDirectory
         self.timeout = timeout.isFinite ? max(0, timeout) : 10
@@ -33,6 +35,7 @@ final class RuntimeConfigValidationRunner {
             binary: binary,
             resourceDirectory: resourceDirectory,
             timeout: timeout,
+            diagnostic: diagnostic,
             file: file,
             completion: completion
         )
@@ -70,6 +73,7 @@ private final class ValidationSession {
     private let binary: URL
     private let resourceDirectory: URL
     private let timeout: TimeInterval
+    private let diagnostic: (String) -> Void
     private let sourceFile: URL
     private var completion: ((String?) -> Void)?
     private var hasFinished = false
@@ -80,12 +84,14 @@ private final class ValidationSession {
         binary: URL,
         resourceDirectory: URL,
         timeout: TimeInterval,
+        diagnostic: @escaping (String) -> Void,
         file: URL,
         completion: @escaping (String?) -> Void
     ) {
         self.binary = binary
         self.resourceDirectory = resourceDirectory
         self.timeout = timeout
+        self.diagnostic = diagnostic
         sourceFile = file
         self.completion = completion
     }
@@ -240,9 +246,13 @@ private final class ValidationSession {
                     guard let baseAddress = bytes.baseAddress else { return 0 }
                     return Darwin.read(inputDescriptor, baseAddress, bytes.count)
                 }
-                if bytesRead == 0 { break }
+                if bytesRead == 0 {
+                    break
+                }
                 if bytesRead < 0 {
-                    if errno == EINTR { continue }
+                    if errno == EINTR {
+                        continue
+                    }
                     throw ValidationPreparationError()
                 }
 
@@ -257,7 +267,9 @@ private final class ValidationSession {
                         )
                     }
                     if bytesWritten < 0 {
-                        if errno == EINTR { continue }
+                        if errno == EINTR {
+                            continue
+                        }
                         throw ValidationPreparationError()
                     }
                     guard bytesWritten > 0 else { throw ValidationPreparationError() }
@@ -350,6 +362,7 @@ private final class ValidationSession {
             "LANG": "C",
             "LC_ALL": "C"
         ]
+        diagnostic("[Config Validation] command=\(binary.path) -t -d \(stage.path) -f \(stage.path)/config.yaml SAFE_PATHS=\(resourceDirectory.standardizedFileURL.path)")
         child.standardInput = FileHandle.nullDevice
         child.standardOutput = standardOutput
         child.standardError = standardError
@@ -426,7 +439,8 @@ private final class ValidationSession {
         let error = child.terminationStatus == 0
             ? nil
             : Self.describeFailure(exitCode: child.terminationStatus, output: output.string)
-        dispatchCompletion(callback, error: error)
+        diagnostic("[Config Validation] stage=\(stage.path) exit=\(child.terminationStatus) detail=\(error ?? "valid")")
+        dispatchCompletion(callback, error: error.map { "\($0) Validation directory: \(stage.path) (removed)." })
     }
 
     private func scheduleTimeout() {
@@ -512,26 +526,38 @@ private final class ValidationSession {
 
     private static func describeFailure(exitCode: Int32, output: String) -> String {
         let normalized = output.lowercased()
+        let category: String
         if normalized.contains("unsupported_tun_stack_build") {
-            return "The bundled core lacks gVisor support. Rebuild it with with_gvisor before enabling this TUN stack."
-        }
-        if ["no such file", "file not found", "does not exist", "failed to open", "cannot open"]
+            category = "The bundled core lacks gVisor support. Rebuild it with with_gvisor before enabling this TUN stack."
+        } else if normalized.contains("path is not subpath of home directory or safe_paths") {
+            category = "A configuration path is outside the allowed configuration directory (check external-ui and providers)."
+        } else if ["no such file", "file not found", "does not exist", "failed to open", "cannot open"]
             .contains(where: normalized.contains) {
-            return "A local file referenced by the configuration is missing or unreadable."
-        }
-        if ["yaml", "syntax error", "unmarshal", "decode error"]
+            category = "A local file referenced by the configuration is missing or unreadable."
+        } else if ["yaml", "syntax error", "unmarshal", "decode error"]
             .contains(where: normalized.contains) {
-            return "The configuration contains invalid YAML."
-        }
-        if ["unknown field", "unsupported", "not supported", "invalid configuration"]
+            category = "The configuration contains invalid YAML."
+        } else if ["unknown field", "unsupported", "not supported", "invalid configuration"]
             .contains(where: normalized.contains) {
-            return "The configuration contains invalid or unsupported settings."
-        }
-        if ["address already in use", "bind:", "listen tcp", "invalid port"]
+            category = "The configuration contains invalid or unsupported settings."
+        } else if ["address already in use", "bind:", "listen tcp", "invalid port"]
             .contains(where: normalized.contains) {
-            return "A configured listener address or port is unavailable."
+            category = "A configured listener address or port is unavailable."
+        } else {
+            category = "Configuration validation failed (exit code \(exitCode))."
         }
-        return "Configuration validation failed (exit code \(exitCode))."
+
+        // Retain the core's actual parse reason, not its surrounding log or an
+        // echoed YAML document. Use the same credential/URL redaction as apply.
+        let lines = output.components(separatedBy: .newlines)
+        let detail = lines.first { $0.lowercased().contains("parse config error") }
+            ?? lines.first {
+                let line = $0.trimmingCharacters(in: .whitespaces).lowercased()
+                return line.hasPrefix("yaml:") || line.hasPrefix("error parsing")
+            }
+        guard let detail else { return category }
+        let safe = RuntimeConfigApplyDiagnostics.sanitize(detail, maximumCharacters: 1_200)
+        return safe.isEmpty ? category : "\(category) Core detail: \(safe)"
     }
 }
 

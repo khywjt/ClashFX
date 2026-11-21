@@ -1,9 +1,9 @@
 import Foundation
 
-/// The Enhanced Mode data-plane monitor only exercises the DIRECT path and the
-/// DNS listener, so it stays green while every proxy node fails. These types
-/// decide, from samples of the nodes the user actually selected, whether the
-/// proxy path is broken and how far automatic recovery should go.
+// The Enhanced Mode data-plane monitor only exercises the DIRECT path and the
+// DNS listener, so it stays green while every proxy node fails. These types
+// decide, from samples of the nodes the user actually selected, whether the
+// proxy path is broken and how far automatic recovery should go.
 
 struct ProxyPathNode: Equatable {
     let type: String
@@ -72,8 +72,10 @@ enum ProxyPathEvaluator {
     /// failing only when every sampled node fails.
     static func verdict(for samples: [ProxyPathSample]) -> ProxyPathVerdict {
         guard !samples.isEmpty else { return .noSample }
-        if samples.contains(where: { $0.failure == nil }) { return .healthy }
-        let kinds = Set(samples.compactMap { $0.failure })
+        if samples.contains(where: { $0.failure == nil }) {
+            return .healthy
+        }
+        let kinds = Set(samples.compactMap(\.failure))
         return .failing(kinds.count == 1 ? kinds.first ?? .unknown : .unknown)
     }
 }
@@ -152,7 +154,9 @@ enum ProxyPathRecoveryDriver {
                 }
             case .reloadConfig:
                 hooks.reloadConfig { error in
-                    if let error = error { hooks.log("in-place reload did not complete (\(error))") }
+                    if let error = error {
+                        hooks.log("in-place reload did not complete (\(error))")
+                    }
                     hooks.after(settleAfterReload) { run(ladder, hooks: hooks) }
                 }
             case .retryLater:
@@ -174,7 +178,9 @@ struct ProxyPathNotificationThrottle {
     }
 
     mutating func shouldNotify(now: Date) -> Bool {
-        if let last = lastNotified, now.timeIntervalSince(last) < interval { return false }
+        if let last = lastNotified, now.timeIntervalSince(last) < interval {
+            return false
+        }
         lastNotified = now
         return true
     }

@@ -12,8 +12,12 @@ enum EnhancedDNSProbeTargetPolicy {
               let port = Int(rawPort), (0 ... 65535).contains(port) else { return nil }
 
         let host = rawHost
-        if host.isEmpty { return "127.0.0.1" }
-        if host == "localhost" { return "127.0.0.1" }
+        if host.isEmpty {
+            return "127.0.0.1"
+        }
+        if host == "localhost" {
+            return "127.0.0.1"
+        }
 
         var ipv4 = in_addr()
         if !host.contains("%"), host.withCString({ inet_pton(AF_INET, $0, &ipv4) }) == 1 {
@@ -102,7 +106,9 @@ enum BoundedDNSProbe {
                 if result > 0 {
                     return descriptor.revents & (events | Int16(POLLHUP) | Int16(POLLERR)) != 0
                 }
-                if result < 0, errno == EINTR { continue }
+                if result < 0, errno == EINTR {
+                    continue
+                }
                 return false
             }
             return false
@@ -150,7 +156,9 @@ enum BoundedDNSProbe {
             while total < raw.count, ProcessInfo.processInfo.systemUptime < deadline {
                 let count = send(fd, base.advanced(by: total), raw.count - total, 0)
                 if count > 0 {
-                    if type == SOCK_DGRAM, count != raw.count { return false }
+                    if type == SOCK_DGRAM, count != raw.count {
+                        return false
+                    }
                     total += count
                 } else if count < 0, errno == EINTR {
                     continue
@@ -167,8 +175,12 @@ enum BoundedDNSProbe {
             while waitFor(Int16(POLLIN)) {
                 var bytes = [UInt8](repeating: 0, count: length)
                 let count = recv(fd, &bytes, length, 0)
-                if count > 0 { return Data(bytes.prefix(count)) }
-                if count < 0, errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK { continue }
+                if count > 0 {
+                    return Data(bytes.prefix(count))
+                }
+                if count < 0, errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK {
+                    continue
+                }
                 return nil
             }
             return nil
@@ -531,7 +543,9 @@ final class TunDNSTransactionController {
                                         _ = settlement.finish("DNS operation superseded; recovery journal retained")
                                         return
                                     }
-                                    if let error { _ = settlement.finish(error); return }
+                                    if let error {
+                                        _ = settlement.finish(error); return
+                                    }
                                     let previousIDs = snapshot["previousTransactionIDs"] as? [String] ?? []
                                     guard !previousIDs.isEmpty else {
                                         self.flushAfterApply(client: client, operationID: operationID,
@@ -627,7 +641,9 @@ final class TunDNSTransactionController {
                 guard !settlement.isSettled, self.activeOperationID == operationID else { return }
                 guard isCurrent() else { _ = settlement.finish("DNS recovery superseded; journal retained"); return }
                 guard !snapshot.isEmpty else { _ = settlement.finish(nil); return }
-                if let error = snapshot["error"] as? String { _ = settlement.finish(error); return }
+                if let error = snapshot["error"] as? String {
+                    _ = settlement.finish(error); return
+                }
                 guard Self.isSupportedJournal(snapshot) else {
                     _ = settlement.finish("Unsupported DNS journal version; recovery evidence retained")
                     return
@@ -635,7 +651,9 @@ final class TunDNSTransactionController {
                 client.restore(snapshot) { error in
                     DispatchQueue.main.async {
                         guard !settlement.isSettled, self.activeOperationID == operationID else { return }
-                        if let error { _ = settlement.finish(error); return }
+                        if let error {
+                            _ = settlement.finish(error); return
+                        }
                         guard isCurrent() else {
                             _ = settlement.finish("DNS recovery superseded; journal retained")
                             return

@@ -10,8 +10,13 @@ enum RuntimePortHandoffWaiter {
         case tcp
         case udp
 
-        var socketType: Int32 { self == .tcp ? SOCK_STREAM : SOCK_DGRAM }
-        var socketProtocol: Int32 { self == .tcp ? IPPROTO_TCP : IPPROTO_UDP }
+        var socketType: Int32 {
+            self == .tcp ? SOCK_STREAM : SOCK_DGRAM
+        }
+
+        var socketProtocol: Int32 {
+            self == .tcp ? IPPROTO_TCP : IPPROTO_UDP
+        }
     }
 
     struct Endpoint: Hashable {
@@ -25,8 +30,13 @@ enum RuntimePortHandoffWaiter {
             self.transport = transport
         }
 
-        fileprivate var isWildcard: Bool { host == "*" || host == "0.0.0.0" }
-        fileprivate var isIPv4: Bool { !host.contains(":") && !host.contains("*") }
+        fileprivate var isWildcard: Bool {
+            host == "*" || host == "0.0.0.0"
+        }
+
+        fileprivate var isIPv4: Bool {
+            !host.contains(":") && !host.contains("*")
+        }
 
         fileprivate func covers(_ candidate: Endpoint) -> Bool {
             guard port == candidate.port, transport == candidate.transport else { return false }
@@ -47,7 +57,9 @@ enum RuntimePortHandoffWaiter {
                 // A distinct TCP socket can own a specific address inside an
                 // existing wildcard. Probe the exact address with SO_REUSEADDR.
                 return owner.host == endpoint.host || endpoint.isWildcard || endpoint.transport == .udp
-            }) { continue }
+            }) {
+                continue
+            }
             let overlapping = baseline.filter { endpoint.covers($0) }
             if endpoint.isWildcard, !overlapping.isEmpty {
                 // A wildcard probe can conflict with our narrower baseline.
@@ -60,7 +72,9 @@ enum RuntimePortHandoffWaiter {
                     }
                     for host in local.hosts {
                         let concrete = Endpoint(host: host, port: endpoint.port, transport: endpoint.transport)
-                        if probeIPv4Wildcard, concrete.isIPv4 { continue }
+                        if probeIPv4Wildcard, concrete.isIPv4 {
+                            continue
+                        }
                         if endpoint.covers(concrete), !overlapping.contains(where: { $0.covers(concrete) }) {
                             requested.insert(concrete)
                         }
@@ -88,7 +102,9 @@ enum RuntimePortHandoffWaiter {
         for key in ["port", "socks-port"] where port(root[key]) == mixed {
             effective[key] = 0
         }
-        if let allowLANOverride { effective["allow-lan"] = allowLANOverride }
+        if let allowLANOverride {
+            effective["allow-lan"] = allowLANOverride
+        }
         return endpoints(in: effective)
     }
 
@@ -140,7 +156,7 @@ enum RuntimePortHandoffWaiter {
                 DispatchQueue.main.async {
                     guard isCurrent() else { completion("Port handoff cancelled: runtime scope changed"); return }
                     let remaining = deadline - ProcessInfo.processInfo.systemUptime
-                    let busy = failures.map { $0.0 }
+                    let busy = failures.map(\.0)
                     guard remaining > 0 else {
                         completion(timeoutError(busy.isEmpty ? endpoints : busy))
                         return
@@ -150,7 +166,9 @@ enum RuntimePortHandoffWaiter {
                         completion("Proxy port \(fatal.0.port)/\(fatal.0.transport.rawValue) cannot be prepared (socket errno \(fatal.1))")
                         return
                     }
-                    if lastBusy.isEmpty { onWaiting(Set(busy.map { $0.port }).sorted()) }
+                    if lastBusy.isEmpty {
+                        onWaiting(Set(busy.map(\.port)).sorted())
+                    }
                     DispatchQueue.main.asyncAfter(deadline: .now() + min(max(0.01, interval), remaining)) { attempt(busy) }
                 }
             }
@@ -166,7 +184,9 @@ enum RuntimePortHandoffWaiter {
             // mapped IPv6 wildcard. Check the native IPv4 bind separately.
             let ipv4 = Endpoint(host: "0.0.0.0", port: endpoint.port)
             let ipv4Error = bindSocket(ipv4)
-            if ipv4Error != 0, ipv4Error != EAFNOSUPPORT, ipv4Error != EPROTONOSUPPORT { return ipv4Error }
+            if ipv4Error != 0, ipv4Error != EAFNOSUPPORT, ipv4Error != EPROTONOSUPPORT {
+                return ipv4Error
+            }
         }
         // Darwin can let a wildcard listener coexist with a concrete claim.
         // Check the concrete addresses that would otherwise receive traffic.
@@ -180,7 +200,9 @@ enum RuntimePortHandoffWaiter {
                 // The interface may have disappeared since the snapshot.
                 continue
             }
-            if error != 0 { return error }
+            if error != 0 {
+                return error
+            }
         }
         return 0
     }
@@ -238,7 +260,9 @@ enum RuntimePortHandoffWaiter {
             return (listener["network"] as? [String] ?? []).compactMap(Transport.init(rawValue:))
         case "trusttunnel":
             let networks = listener["network"] as? [String] ?? []
-            if networks.isEmpty { return [.tcp] }
+            if networks.isEmpty {
+                return [.tcp]
+            }
             return [.tcp, .udp].filter { transport in
                 networks.contains { $0.lowercased().hasPrefix(transport.rawValue) }
             }
@@ -279,7 +303,9 @@ enum RuntimePortHandoffWaiter {
     }
 
     private static func port(_ value: Any?) -> Int {
-        if let text = value as? String, let port = Int(text), (1 ... 65_535).contains(port) { return port }
+        if let text = value as? String, let port = Int(text), (1 ... 65_535).contains(port) {
+            return port
+        }
         guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID() else { return 0 }
         let port = number.doubleValue
         guard port.isFinite, port.rounded(.towardZero) == port, (1 ... 65_535).contains(port) else { return 0 }
@@ -288,11 +314,17 @@ enum RuntimePortHandoffWaiter {
 
     private static func canonicalHost(_ value: String) -> String? {
         let host = value.trimmingCharacters(in: CharacterSet(charactersIn: "[]")).lowercased()
-        if host == "*" || host.isEmpty { return "*" }
-        if host == "localhost" { return "127.0.0.1" }
+        if host == "*" || host.isEmpty {
+            return "*"
+        }
+        if host == "localhost" {
+            return "127.0.0.1"
+        }
 
         var ipv4 = in_addr()
-        if inet_pton(AF_INET, host, &ipv4) == 1 { return host }
+        if inet_pton(AF_INET, host, &ipv4) == 1 {
+            return host
+        }
 
         let parts = host.split(separator: "%", maxSplits: 1, omittingEmptySubsequences: false)
         guard let address = parts.first else { return nil }
@@ -301,11 +333,15 @@ enum RuntimePortHandoffWaiter {
         var name = [CChar](repeating: 0, count: Int(INET6_ADDRSTRLEN))
         guard inet_ntop(AF_INET6, &ipv6, &name, socklen_t(name.count)) != nil else { return nil }
         let numeric = String(cString: name)
-        if numeric == "::" { return "*" }
+        if numeric == "::" {
+            return "*"
+        }
         if numeric.hasPrefix("::ffff:"), numeric.dropFirst("::ffff:".count).contains(".") {
             return String(numeric.dropFirst("::ffff:".count))
         }
-        if parts.count == 2 { return numeric + "%" + parts[1] }
+        if parts.count == 2 {
+            return numeric + "%" + parts[1]
+        }
         return numeric
     }
 
@@ -359,7 +395,9 @@ enum RuntimePortHandoffWaiter {
             guard setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &only, socklen_t(MemoryLayout.size(ofValue: only))) == 0 else { return errno }
         }
         guard bind(fd, address.ai_addr, address.ai_addrlen) == 0 else { return errno }
-        if endpoint.transport == .tcp, listen(fd, 1) != 0 { return errno }
+        if endpoint.transport == .tcp, listen(fd, 1) != 0 {
+            return errno
+        }
         return 0
     }
 }

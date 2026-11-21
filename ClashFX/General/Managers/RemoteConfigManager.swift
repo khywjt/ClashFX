@@ -94,12 +94,12 @@ class RemoteConfigManager {
     }
 
     func updateCheck(ignoreTimeLimit: Bool = false, showNotification: Bool = false) {
-        let currentConfigName = ConfigManager.selectConfigName
-
         let group = DispatchGroup()
 
         for config in configs {
-            if config.updating { continue }
+            if config.updating {
+                continue
+            }
             let timeLimitNoMantians = Date().timeIntervalSince(config.updateTime ?? Date(timeIntervalSince1970: 0)) < Settings.configAutoUpdateInterval
 
             if timeLimitNoMantians && !ignoreTimeLimit {
@@ -107,38 +107,44 @@ class RemoteConfigManager {
                 continue
             }
             Logger.log("[Auto Upgrade] Requesting \(config.name)")
-            let isCurrentConfig = config.name == currentConfigName
             config.updating = true
             group.enter()
             RemoteConfigManager.updateConfig(config: config) { [weak config] error in
-                group.leave()
-                guard let config = config else { return }
-
-                config.updating = false
+                guard let config = config else { group.leave(); return }
                 if error == nil {
                     config.updateTime = Date()
                 }
 
-                if isCurrentConfig {
-                    if let error = error {
-                        // Fail
-                        if showNotification {
+                let finish: (String?) -> Void = { result in
+                    config.updating = false
+                    let isCurrentConfig = config.name == ConfigManager.selectConfigName
+                    if isCurrentConfig {
+                        if let result {
+                            // Background refreshes must not hold the runtime
+                            // transaction open inside a modal error window.
                             NSUserNotificationCenter.default
                                 .post(title: NSLocalizedString("Remote Config Update Fail", comment: ""),
-                                      info: "\(config.name): \(error)")
-                        }
-
-                    } else {
-                        // Success
-                        if showNotification {
+                                      info: "\(config.name): \(RuntimeConfigApplyDiagnostics.sanitize(result))")
+                        } else if showNotification {
                             let info = "\(config.name): \(NSLocalizedString("Succeed!", comment: ""))"
                             NSUserNotificationCenter.default
                                 .post(title: NSLocalizedString("Remote Config Update", comment: ""), info: info)
                         }
-                        AppDelegate.shared.updateConfig(showNotification: false)
                     }
+                    Logger.log("[Auto Upgrade] Finish \(config.name) result: \(result.map { RuntimeConfigApplyDiagnostics.sanitize($0) } ?? "succeed")")
+                    group.leave()
                 }
-                Logger.log("[Auto Upgrade] Finish \(config.name) result: \(error ?? "succeed")")
+
+                // The user may have switched profiles while the download was
+                // in flight. Only reload the profile that is still selected.
+                if error == nil, config.name == ConfigManager.selectConfigName {
+                    // Download success is not runtime success. Keep the update
+                    // in flight until validation/apply/readback has settled.
+                    AppDelegate.shared.updateConfig(showNotification: false, showError: false,
+                                                    completeHandler: finish)
+                } else {
+                    finish(error)
+                }
             }
         }
 
@@ -833,8 +839,12 @@ class RemoteConfigManager {
 
         if isTLS {
             lines.append("    tls: true")
-            if !sni.isEmpty { lines.append("    servername: \"\(escapeYAML(sni))\"") }
-            if !fp.isEmpty { lines.append("    client-fingerprint: \"\(escapeYAML(fp))\"") }
+            if !sni.isEmpty {
+                lines.append("    servername: \"\(escapeYAML(sni))\"")
+            }
+            if !fp.isEmpty {
+                lines.append("    client-fingerprint: \"\(escapeYAML(fp))\"")
+            }
             appendALPN(to: &lines, alpn: alpn)
         }
 
@@ -876,9 +886,15 @@ class RemoteConfigManager {
         lines.append("    password: \"\(escapeYAML(password))\"")
         lines.append("    udp: true")
 
-        if !sni.isEmpty { lines.append("    sni: \"\(escapeYAML(sni))\"") }
-        if allowInsecure { lines.append("    skip-cert-verify: true") }
-        if !fp.isEmpty { lines.append("    client-fingerprint: \"\(escapeYAML(fp))\"") }
+        if !sni.isEmpty {
+            lines.append("    sni: \"\(escapeYAML(sni))\"")
+        }
+        if allowInsecure {
+            lines.append("    skip-cert-verify: true")
+        }
+        if !fp.isEmpty {
+            lines.append("    client-fingerprint: \"\(escapeYAML(fp))\"")
+        }
         appendALPN(to: &lines, alpn: alpn)
         appendTransportOpts(to: &lines, network: transport, headerType: "none",
                             host: host, path: path, serviceName: serviceName)
@@ -924,19 +940,29 @@ class RemoteConfigManager {
         lines.append("    uuid: \"\(escapeYAML(uuid))\"")
         lines.append("    udp: true")
 
-        if !flow.isEmpty { lines.append("    flow: \"\(escapeYAML(flow))\"") }
+        if !flow.isEmpty {
+            lines.append("    flow: \"\(escapeYAML(flow))\"")
+        }
 
         if security == "tls" || security == "reality" {
             lines.append("    tls: true")
-            if !sni.isEmpty { lines.append("    servername: \"\(escapeYAML(sni))\"") }
-            if allowInsecure { lines.append("    skip-cert-verify: true") }
-            if !fp.isEmpty { lines.append("    client-fingerprint: \"\(escapeYAML(fp))\"") }
+            if !sni.isEmpty {
+                lines.append("    servername: \"\(escapeYAML(sni))\"")
+            }
+            if allowInsecure {
+                lines.append("    skip-cert-verify: true")
+            }
+            if !fp.isEmpty {
+                lines.append("    client-fingerprint: \"\(escapeYAML(fp))\"")
+            }
             appendALPN(to: &lines, alpn: alpn)
 
             if security == "reality" {
                 lines.append("    reality-opts:")
                 lines.append("      public-key: \"\(escapeYAML(pbk))\"")
-                if !sid.isEmpty { lines.append("      short-id: \"\(escapeYAML(sid))\"") }
+                if !sid.isEmpty {
+                    lines.append("      short-id: \"\(escapeYAML(sid))\"")
+                }
             }
         }
 
@@ -971,13 +997,23 @@ class RemoteConfigManager {
         lines.append("    type: hysteria2")
         lines.append("    server: \"\(escapeYAML(server))\"")
         lines.append("    port: \(port)")
-        if !password.isEmpty { lines.append("    password: \"\(escapeYAML(password))\"") }
+        if !password.isEmpty {
+            lines.append("    password: \"\(escapeYAML(password))\"")
+        }
         lines.append("    udp: true")
 
-        if !sni.isEmpty { lines.append("    sni: \"\(escapeYAML(sni))\"") }
-        if allowInsecure { lines.append("    skip-cert-verify: true") }
-        if !obfs.isEmpty { lines.append("    obfs: \"\(escapeYAML(obfs))\"") }
-        if !obfsPassword.isEmpty { lines.append("    obfs-password: \"\(escapeYAML(obfsPassword))\"") }
+        if !sni.isEmpty {
+            lines.append("    sni: \"\(escapeYAML(sni))\"")
+        }
+        if allowInsecure {
+            lines.append("    skip-cert-verify: true")
+        }
+        if !obfs.isEmpty {
+            lines.append("    obfs: \"\(escapeYAML(obfs))\"")
+        }
+        if !obfsPassword.isEmpty {
+            lines.append("    obfs-password: \"\(escapeYAML(obfsPassword))\"")
+        }
 
         return ParsedProxyResult(name: name, yaml: lines.joined(separator: "\n"))
     }
@@ -1018,12 +1054,18 @@ class RemoteConfigManager {
         lines.append("    port: \(port)")
         lines.append("    udp: true")
 
-        if !authStr.isEmpty { lines.append("    auth-str: \"\(escapeYAML(authStr))\"") }
+        if !authStr.isEmpty {
+            lines.append("    auth-str: \"\(escapeYAML(authStr))\"")
+        }
         lines.append("    up: \"\(escapeYAML(upMbps)) Mbps\"")
         lines.append("    down: \"\(escapeYAML(downMbps)) Mbps\"")
 
-        if !sni.isEmpty { lines.append("    sni: \"\(escapeYAML(sni))\"") }
-        if allowInsecure { lines.append("    skip-cert-verify: true") }
+        if !sni.isEmpty {
+            lines.append("    sni: \"\(escapeYAML(sni))\"")
+        }
+        if allowInsecure {
+            lines.append("    skip-cert-verify: true")
+        }
         if obfs == "xplus" && !obfsParam.isEmpty {
             lines.append("    obfs: \"\(escapeYAML(obfsParam))\"")
         }
@@ -1046,9 +1088,15 @@ class RemoteConfigManager {
 
     /// JSON values may arrive as Int, String, or Double depending on the provider.
     private static func intValue(_ value: Any?) -> Int? {
-        if let i = value as? Int { return i }
-        if let s = value as? String { return Int(s) }
-        if let d = value as? Double { return Int(d) }
+        if let i = value as? Int {
+            return i
+        }
+        if let s = value as? String {
+            return Int(s)
+        }
+        if let d = value as? Double {
+            return Int(d)
+        }
         return nil
     }
 
@@ -1063,7 +1111,9 @@ class RemoteConfigManager {
             lines.append("    network: ws")
             if !path.isEmpty || !host.isEmpty {
                 lines.append("    ws-opts:")
-                if !path.isEmpty { lines.append("      path: \"\(escapeYAML(path))\"") }
+                if !path.isEmpty {
+                    lines.append("      path: \"\(escapeYAML(path))\"")
+                }
                 if !host.isEmpty {
                     lines.append("      headers:")
                     lines.append("        Host: \"\(escapeYAML(host))\"")
@@ -1084,7 +1134,9 @@ class RemoteConfigManager {
                     lines.append("      host:")
                     lines.append("        - \"\(escapeYAML(host))\"")
                 }
-                if !path.isEmpty { lines.append("      path: \"\(escapeYAML(path))\"") }
+                if !path.isEmpty {
+                    lines.append("      path: \"\(escapeYAML(path))\"")
+                }
             }
         case "tcp" where headerType == "http":
             lines.append("    network: http")

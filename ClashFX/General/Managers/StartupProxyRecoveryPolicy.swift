@@ -47,6 +47,7 @@ enum StartupProxyRecoveryPolicy {
 
 enum RuntimeDataPlaneProbeOutcome {
     case healthy
+    case dnsDegraded
     case confirmedCoreFailure
     case baselineUnavailable
 }
@@ -252,6 +253,19 @@ enum DNSReadiness: Equatable {
 }
 
 enum EnhancedModeDNSReadinessPolicy {
+    // The local DNS server answers STATUS itself, even when its upstream resolvers time out.
+    static func listenerStatusQuery(transactionID: UInt16) -> [UInt8] {
+        [UInt8(transactionID >> 8), UInt8(transactionID & 0xff), 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    }
+
+    static func isListenerStatusResponse(_ data: Data, transactionID: UInt16) -> Bool {
+        guard data.count >= 12 else { return false }
+        let header = Array(data.prefix(4))
+        return header[0] == UInt8(transactionID >> 8)
+            && header[1] == UInt8(transactionID & 0xff)
+            && header[2] & 0xf8 == 0x90
+    }
+
     static func matchesExpectedCoreBinary(_ actualPath: String?, bundlePath: String, approvedPath: String) -> Bool {
         guard let actualPath, !actualPath.isEmpty else { return false }
         let actual = URL(fileURLWithPath: actualPath).standardizedFileURL.path
@@ -488,7 +502,7 @@ enum RuntimeDataPlaneFailurePolicy {
         outcome: RuntimeDataPlaneProbeOutcome
     ) -> Int {
         switch outcome {
-        case .healthy:
+        case .healthy, .dnsDegraded:
             return 0
         case .confirmedCoreFailure:
             return current + 1

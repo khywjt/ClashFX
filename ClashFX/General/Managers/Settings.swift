@@ -10,6 +10,15 @@ import Foundation
 import Network
 
 enum Settings {
+    @UserDefault("aiFailoverEnabledProfiles", defaultValue: [String]())
+    static var aiFailoverEnabledProfiles: [String]
+
+    @UserDefault("aiFailoverHeldProfiles", defaultValue: [String]())
+    static var aiFailoverHeldProfiles: [String]
+
+    @UserDefault("aiFailoverManualPauseUntil", defaultValue: [String: Double]())
+    static var aiFailoverManualPauseUntil: [String: Double]
+
     @UserDefault(
         "actionShortcutScope",
         defaultValue: ShortcutRegistrationPolicy.defaultActionScope.rawValue

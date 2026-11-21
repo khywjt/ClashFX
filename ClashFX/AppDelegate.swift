@@ -107,6 +107,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     private enum EnhancedModeDataPlaneHealth {
         case healthy(delay: Int)
+        case dnsDegraded(delay: Int, reason: String)
         case coreUnavailable(String)
         case networkUnavailable(coreReason: String, directReason: String)
     }
@@ -252,11 +253,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     var disposeBag = DisposeBag()
     var statusItemView: StatusItemViewProtocol!
-    var isSpeedTesting = false
+    private var aiFailoverRuntime: AIFailoverRuntime?
+    var isSpeedTesting = false {
+        didSet {
+            if isSpeedTesting { aiFailoverRuntime?.supervisor.invalidate(reason: "正在测速", stabilization: 10) }
+        }
+    }
     private var activeBenchmarkSession: ApiRequest.BenchmarkSession?
 
     var runAfterConfigReload: (() -> Void)?
-    var isConfigUpdating = false
+    var isConfigUpdating = false {
+        didSet {
+            if isConfigUpdating { aiFailoverRuntime?.supervisor.invalidate(reason: "正在重载配置", stabilization: 10) }
+        }
+    }
     private let configUpdateTransaction = ConfigUpdateTransactionCoordinator()
     private var runtimeCoreSessionID = UUID()
     private var confirmedRuntimeProfileName: String?
@@ -333,10 +343,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         enhancedModeGeneration &+ proxyInteractionEpoch
     }
 
-    private var deferredConfigUpdateID: UUID?
+    private var deferredConfigUpdateID: UUID? {
+        didSet {
+            if deferredConfigUpdateID != nil { aiFailoverRuntime?.supervisor.invalidate(reason: "配置更新已排队", stabilization: 10) }
+        }
+    }
     private var deferredConfigUpdateWork: DispatchWorkItem?
     private var deferredConfigUpdateCompletion: ((ErrorString?) -> Void)?
-    private var selectionMemoryRestoration: ProxySelectionMemoryRestorationController?
+    private var selectionMemoryRestoration: ProxySelectionMemoryRestorationController? {
+        didSet {
+            if selectionMemoryRestoration != nil { aiFailoverRuntime?.supervisor.invalidate(reason: "正在恢复节点选择", stabilization: 10) }
+        }
+    }
 
     var isConfigUpdateQueued: Bool {
         deferredConfigUpdateID != nil
@@ -362,11 +380,45 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func invalidateProxyInteractionScope(reason: String) {
         proxyInteractionEpoch &+= 1
+        aiFailoverRuntime?.supervisor.invalidate(reason: reason, stabilization: 10)
         systemProxyAutoRecovery.cancel()
         claudeRuleModeAutoRecovery.cancel()
         selectionMemoryRestoration?.cancel()
         ProxyGroupSelectionController.invalidateAll()
         cancelActiveSpeedTest(reason: reason, refreshMenu: false)
+    }
+
+    func aiFailoverPauseReason() -> String? {
+        if !ownsRuntimeControl || isTerminating || isRestarting { return "应用生命周期变化" }
+        if !ConfigManager.shared.isRunning && RemoteControlManager.selectConfig == nil { return "核心未运行" }
+        if isConfigUpdating || isConfigUpdateQueued || runtimeConfigTransactions.isBusy || runtimeConfigTransactions.isUncertain {
+            return "配置正在变更或尚未确认"
+        }
+        if !isCoreConfigSnapshotVerified { return "等待核心配置读回确认" }
+        if isEnhancedModeTransitionInProgress || claudeLockChange != nil { return "核心或增强模式正在切换" }
+        if isRestoringProxySelection || userSystemProxyChangeInProgress { return "正在恢复节点或系统代理" }
+        if isSpeedTesting { return "正在测速" }
+        if isOutboundModeChangeInFlight || !outboundModeChangeQueue.isEmpty { return "代理模式正在切换" }
+        if ConfigManager.shared.currentConfig?.mode != .rule { return "仅在规则模式监督 AI 分组" }
+        if Settings.claudeProxyLockEnabled &&
+            (Settings.claudeProxyLockTarget.isEmpty || Settings.claudeProxyLockTarget == AIFailoverTopology.group) {
+            return "Claude 固定锁目标无法与 AI 分组安全分离"
+        }
+        return nil
+    }
+
+    /// Inspect the already confirmed runtime copy; never rebuild/reapply a lock.
+    func aiFailoverClaudeLockPauseReason() -> String? {
+        guard Settings.claudeProxyLockEnabled else { return nil }
+        guard RemoteControlManager.selectConfig == nil else { return "远端 Claude 锁依赖无法确认" }
+        let data = ConfigManager.shared.isEnhancedModeActive ? lastConfirmedEnhancedData : builtInRecoveryCheckpoint
+        guard let data, let root = try? Yams.load(yaml: String(decoding: data, as: UTF8.self)) as? [String: Any],
+              ClaudeProxyLockPolicy.isIndependent(target: Settings.claudeProxyLockTarget,
+                                                  of: AIFailoverTopology.group, in: root,
+                                                  providers: claudeLockProviderSnapshots(in: root)) else {
+            return "Claude 锁依赖 AI 分组，或固定锁依赖无法确认"
+        }
+        return nil
     }
 
     private func cancelDeferredConfigUpdate(reason: String) {
@@ -640,7 +692,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             ConfigManager.shared.isProxySetByOtherVariable.accept(!observation.matches)
             if observation.matches {
                 self.wakeSystemProxyRecoveryRequested = false
-                if !self.systemProxyAutoRecovery.isSuspended { self.proxySettingMenuItem.toolTip = nil }
+                if !self.systemProxyAutoRecovery.isSuspended {
+                    self.proxySettingMenuItem.toolTip = nil
+                }
             }
         },
         didSuspend: { [weak self] in
@@ -720,7 +774,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func requestSystemProxyAutoRecovery(afterWake: Bool = false) {
         guard ownsRuntimeControl, !isTerminating else { return }
-        if afterWake { wakeSystemProxyRecoveryRequested = true }
+        if afterWake {
+            wakeSystemProxyRecoveryRequested = true
+        }
         systemProxyAutoRecovery.request()
         claudeRuleModeAutoRecovery.request()
     }
@@ -761,6 +817,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             AppLogoTool.applyLogo()
         }
         setupStatusMenuItemData()
+        aiFailoverRuntime = AIFailoverRuntime(app: self)
+        aiFailoverRuntime?.start()
         installTurnOffProxyMenuItem()
         installAdvancedTunMenuItem()
         installBypassChineseAppsMenuItem()
@@ -944,6 +1002,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ aNotification: Notification) {
         guard ownsRuntimeControl else { return }
+        aiFailoverRuntime?.stop()
         systemProxyAutoRecovery.cancel()
         claudeRuleModeAutoRecovery.cancel()
         UserDefaults.standard.set(0, forKey: "launch_fail_times")
@@ -1629,7 +1688,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             Logger.log("[Automatic Recovery] stage=blocked outcome=blocked code=builtin-fallback built-in start requires verified recovery or explicit scope change", level: .error)
             return "Built-in start blocked until automatic recovery selections are verified"
         }
-        if ConfigManager.shared.isRunning { return nil }
+        if ConfigManager.shared.isRunning {
+            return nil
+        }
         ApiRequest.cancelRuntimeConfigOperations()
         runtimeConfigTransactions.invalidate()
         runtimeCoreSessionID = UUID()
@@ -1823,7 +1884,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     "requested=\(verification.mode.rawValue) actual=\(config.mode.rawValue)",
                 level: .error
             )
-            if claudeLockChange == nil { ConfigManager.selectOutBoundMode = config.mode }
+            if claudeLockChange == nil {
+                ConfigManager.selectOutBoundMode = config.mode
+            }
             notifyOutboundModeChangeFailure(mode: verification.mode)
             return
         }
@@ -1927,7 +1990,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
             if let portError {
                 self.isBuiltInCoreResumeRetryAvailable = true
-                if showError { NSUserNotificationCenter.default.postConfigErrorNotice(msg: portError) }
+                if showError {
+                    NSUserNotificationCenter.default.postConfigErrorNotice(msg: portError)
+                }
                 self.finishConfigUpdate(transactionID: transactionID, error: portError)
                 return
             }
@@ -1944,7 +2009,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         if let portHandoffDeadline, !ConfigManager.shared.isRunning {
             waitForBuiltInProxyPort(deadline: portHandoffDeadline, useStartupOverrides: true,
-                                   isCurrent: canStartCore, completion: startUpdate)
+                                    isCurrent: canStartCore, completion: startUpdate)
         } else {
             startUpdate(nil)
         }
@@ -1977,12 +2042,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     self.restoreVerifiedRuntimeBaselineIfAvailable(scope: reloadRuntimeScope, receiptID: validatedBaselineID)
                 }
                 Logger.log("[Runtime Configuration] stage=reload_failed transaction=\(transactionID) reason=\(RuntimeConfigApplyDiagnostics.sanitize(err))", level: .error)
-                if showError { UpdateConfigAction.showError(text: err, configName: config) }
+                if showError {
+                    UpdateConfigAction.showError(text: err, configName: config)
+                }
                 MenuItemFactory.recreateProxyMenuItems()
                 self.finishConfigUpdate(transactionID: transactionID, error: err)
                 return
             }
-            if let selectedConfig { ConfigManager.selectConfigName = selectedConfig }
+            if let selectedConfig {
+                ConfigManager.selectConfigName = selectedConfig
+            }
             self.finishReloadAfterConfigReadback(transactionID: transactionID, showNotification: showNotification)
         }
 
@@ -2096,7 +2165,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 RuntimeConfigReadbackPolicy.portPlan(config: $0,
                                                      apiPort: Int(ConfigManager.shared.apiPort) ?? 0, owned: true)
             }
-            if enhanced && plan == nil { finish("The enhanced core has no verified port plan"); return }
+            if enhanced && plan == nil {
+                finish("The enhanced core has no verified port plan"); return
+            }
             let planJSON = plan.flatMap { try? JSONSerialization.data(withJSONObject: $0) }
                 .flatMap { String(data: $0, encoding: .utf8) } ?? ""
             let apiAddress = confirmed?["external-controller"] as? String
@@ -2114,8 +2185,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     do {
                         let patch = self.writeRuntimePatchedConfigIfNeeded(for: configName, sourcePath: sourcePath,
                                                                            includeRulePatch: !enhanced, outputPath: runtimePath, lockSettings: lockSettings)
-                        if let error = patch.error { throw NSError(domain: "ClashFX.RuntimeConfig", code: 1,
-                                                                   userInfo: [NSLocalizedDescriptionKey: error]) }
+                        if let error = patch.error {
+                            throw NSError(domain: "ClashFX.RuntimeConfig", code: 1,
+                                          userInfo: [NSLocalizedDescriptionKey: error])
+                        }
                         let text = try String(contentsOfFile: patch.path ?? sourcePath, encoding: .utf8)
                         guard var root = try Yams.load(yaml: text) as? [String: Any] else {
                             throw NSError(domain: "ClashFX.RuntimeConfig", code: 2)
@@ -2213,13 +2286,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.main.async {
                 guard isCurrent() else { completion("Runtime validation scope changed"); return }
                 guard endpointError == "" else {
-                    if let endpointError = endpointError { Self.logPortConflictOwner(endpointError) }
+                    if let endpointError = endpointError {
+                        Self.logPortConflictOwner(endpointError)
+                    }
                     completion(endpointError?.hasPrefix("error:[port_conflict]") == true
                         ? endpointError : "Runtime configuration structure or endpoints are invalid")
                     return
                 }
                 let runner = RuntimeConfigValidationRunner(binary: binary,
-                                                           resourceDirectory: URL(fileURLWithPath: kConfigFolderPath), timeout: 10)
+                                                           resourceDirectory: URL(fileURLWithPath: kConfigFolderPath), timeout: 10,
+                                                           diagnostic: { Logger.log($0) })
                 self.runtimeValidationOperations[id] = runner.validate(file: file) { error in
                     self.runtimeValidationOperations[id] = nil
                     completion(isCurrent() ? error : "Runtime validation scope changed")
@@ -2293,7 +2369,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         verifyRuntimeCandidate(file: URL(fileURLWithPath: path), context: context, isCurrent: current) { result in
             guard current() else { completion("Enhanced checkpoint scope changed"); return }
             guard case let .verified(dataPlane) = result else {
-                if case let .failed(error) = result { completion(error) }
+                if case let .failed(error) = result {
+                    completion(error)
+                }
                 return
             }
             DispatchQueue.global(qos: .userInitiated).async {
@@ -2396,8 +2474,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
         }
-        if let previous { inspect(previous.data) }
-        else { ApiRequest.lastSubmittedRuntimeConfig(completion: inspect) }
+        if let previous {
+            inspect(previous.data)
+        } else {
+            ApiRequest.lastSubmittedRuntimeConfig(completion: inspect)
+        }
     }
 
     private func applyRuntimeConfiguration(path: String, profile: String, isCurrent: @escaping () -> Bool,
@@ -2407,6 +2488,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                                            completion: @escaping (String?) -> Void) {
         let scope = runtimeConfigurationScope
         let context = ApiRequest.runtimeConfigContext()
+        let builtIn = !ConfigManager.shared.isEnhancedModeActive
         let current: () -> Bool = { [weak self] in
             guard let self else { return false }
             return isCurrent() && self.ownsRuntimeControl && !self.isTerminating && !self.isRestarting &&
@@ -2434,6 +2516,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                         root["mode"] = mode.rawValue
                         root["external-controller"] = apiAddress
                         root["secret"] = context.secret
+                        if builtIn {
+                            var tun = root["tun"] as? [String: Any] ?? [:]
+                            tun["enable"] = false
+                            root["tun"] = tun
+                        }
                         if let error = RuntimeConfigReadbackPolicy.candidateError(root) {
                             throw NSError(domain: "ClashFX.RuntimeConfig", code: 5, userInfo: [NSLocalizedDescriptionKey: error])
                         }
@@ -2441,11 +2528,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                         if context.direct {
                             root = RuntimeConfigReadbackPolicy.preservingBuiltInSessionIPv6(in: root, confirmed: confirmedRoot)
                         }
-                        return (try Data(Yams.dump(object: root).utf8), root)
+                        return try (Data(Yams.dump(object: root).utf8), root)
                     }
                     let submit: (String?) -> Void = { waitError in
                         guard current() else { completion("Runtime scope changed while preparing configuration"); return }
-                        if let waitError { completion(waitError); return }
+                        if let waitError {
+                            completion(waitError); return
+                        }
                         guard case let .success((data, _)) = result else { completion("The candidate runtime configuration could not be prepared"); return }
                         let previousProfile = self.confirmedRuntimeProfileName
                         let baselineKind = RuntimeConfigBaselineKind(confirmedProfile: previousProfile)
@@ -2467,6 +2556,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                             validate: { file, done in self.validateRuntimeCandidate(file: file, isCurrent: current, completion: done) },
                             apply: { file, done in
                                 guard current() else { done(.uncertain("Runtime scope changed before configuration apply")); return }
+                                self.claudeLockChange?.runtimeTouched = true
                                 ApiRequest.applyRuntimeConfig(file: file, context: context) { result in
                                     guard current() else { done(.uncertain("Runtime scope changed during configuration apply")); return }
                                     guard case .accepted = result else { done(result); return }
@@ -2481,10 +2571,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                             }
                         )
                         self.runtimeConfigTransactions.submit(data: data, scope: scope, isCurrent: current, client: client,
-                            retryAfterVerifiedRollback: baselineKind == .startup,
-                            onRetry: { reason in
-                                Logger.log("[Runtime Configuration] stage=retry attempt=2 baseline_kind=startup rollback=verified reason=\(RuntimeConfigApplyDiagnostics.sanitize(reason))", level: .warning)
-                            }) { outcome in
+                                                              retryAfterVerifiedRollback: baselineKind == .startup,
+                                                              onRetry: { reason in
+                                                                  Logger.log("[Runtime Configuration] stage=retry attempt=2 baseline_kind=startup rollback=verified reason=\(RuntimeConfigApplyDiagnostics.sanitize(reason))", level: .warning)
+                                                              }) { outcome in
                             switch outcome {
                             case let .applied(receipt):
                                 publish(receipt)
@@ -2844,6 +2934,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// Bumping the generation makes every queued or in-flight step abandon.
     @objc func abandonWakeRecoveryOnSleep() {
         guard !isTerminating else { return }
+        aiFailoverRuntime?.supervisor.sleep()
         pendingWakeRecoveryWork?.cancel()
         pendingWakeRecoveryWork = nil
         wakeRecoveryGeneration += 1
@@ -2852,6 +2943,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc func resetProxySettingOnWakeupFromSleep() {
         guard !isTerminating else { return }
+        aiFailoverRuntime?.supervisor.wake()
         Logger.log("Wake recovery: didWake received")
         recordWakeRecoveryBreadcrumb("didWake received", expectsProgressWithin: Self.wakeRecoveryDelay + 2)
 
@@ -2929,13 +3021,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         checkEnhancedModeCoreCPU()
-        guard !isEnhancedModeHealthCheckInFlight else { return }
+        guard !isEnhancedModeHealthCheckInFlight, !isConfigUpdating, !isConfigUpdateQueued else { return }
 
+        let identity = configSyncReadbackIdentity
+        let wakeGeneration = wakeRecoveryGeneration
         isEnhancedModeHealthCheckInFlight = true
         checkCoreHealthAfterWake { [weak self] health in
             guard let self = self else { return }
 
-            guard Settings.enhancedMode,
+            guard self.configSyncReadbackIdentity == identity,
+                  self.wakeRecoveryGeneration == wakeGeneration,
+                  !self.isConfigUpdating, !self.isConfigUpdateQueued,
+                  Settings.enhancedMode,
                   ConfigManager.shared.isEnhancedModeActive,
                   self.enhancedModeMenuItem.isEnabled,
                   !self.isWakeEnhancedModeRestarting,
@@ -2956,7 +3053,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 self.consecutiveEnhancedModeHealthFailures = 0
                 self.consecutiveEnhancedModeAPIFailures = 0
                 self.enhancedModeAPIFailureStartedAt = nil
-                self.checkEnhancedModeDataPlaneIfDue()
+                self.checkEnhancedModeDataPlaneIfDue(identity: identity, wakeGeneration: wakeGeneration)
             case let .unhealthy(reason):
                 if NetworkChangeNotifier.getPrimaryInterface() == nil {
                     self.isEnhancedModeHealthCheckInFlight = false
@@ -3204,7 +3301,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func checkEnhancedModeDataPlaneIfDue() {
+    private func checkEnhancedModeDataPlaneIfDue(
+        identity: RuntimeConfigReadbackPolicy.SyncIdentity,
+        wakeGeneration: Int
+    ) {
         let now = Date()
         guard now.timeIntervalSince(lastEnhancedModeDataPlaneProbeAt) >=
             Self.enhancedModeDataPlaneProbeInterval,
@@ -3220,7 +3320,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self = self else { return }
             self.isEnhancedModeHealthCheckInFlight = false
 
-            guard Settings.enhancedMode,
+            guard self.configSyncReadbackIdentity == identity,
+                  self.wakeRecoveryGeneration == wakeGeneration,
+                  !self.isConfigUpdating, !self.isConfigUpdateQueued,
+                  Settings.enhancedMode,
                   ConfigManager.shared.isEnhancedModeActive,
                   self.enhancedModeMenuItem.isEnabled,
                   !self.isWakeEnhancedModeRestarting,
@@ -3253,7 +3356,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 completion(
                     healthy
                         ? .healthy(delay: delay)
-                        : .coreUnavailable(reason)
+                        : .dnsDegraded(delay: delay, reason: reason)
                 )
             }
         }
@@ -3466,7 +3569,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private func handleEnhancedModeDataPlaneHealth(_ health: EnhancedModeDataPlaneHealth) {
         switch health {
         case let .healthy(delay):
-            if consecutiveEnhancedModeDataPlaneFailures > 0 {
+            if consecutiveEnhancedModeDataPlaneFailures > 0 ||
+                enhancedModeRuntimeHealthSummary.hasPrefix("DNS degraded:") {
                 Logger.log(
                     "Enhanced Mode data plane recovered (DIRECT \(delay) ms)"
                 )
@@ -3476,6 +3580,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 outcome: .healthy
             )
             enhancedModeRuntimeHealthSummary = "healthy (DIRECT \(delay) ms)"
+
+        case let .dnsDegraded(delay, reason):
+            if !enhancedModeRuntimeHealthSummary.hasPrefix("DNS degraded:") {
+                Logger.log(
+                    "Enhanced Mode DNS resolution degraded while core DIRECT answered: \(reason)",
+                    level: .warning
+                )
+            }
+            consecutiveEnhancedModeDataPlaneFailures = RuntimeDataPlaneFailurePolicy.nextFailureCount(
+                current: consecutiveEnhancedModeDataPlaneFailures,
+                outcome: .dnsDegraded
+            )
+            enhancedModeRuntimeHealthSummary = "DNS degraded: \(reason) (DIRECT \(delay) ms)"
 
         case let .networkUnavailable(coreReason, directReason):
             let preservedFailures = RuntimeDataPlaneFailurePolicy.nextFailureCount(
@@ -3532,7 +3649,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 return
             }
 
-            lastEnhancedModeDataPlaneRecoveryTime = now
             enhancedModeRuntimeHealthSummary =
                 "automatic recovery triggered after confirmed data-plane failures"
             let diagnosticReason =
@@ -3551,9 +3667,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
+        let identity = configSyncReadbackIdentity
+        let wakeGeneration = wakeRecoveryGeneration
         if deferAutomaticRecoveryForModeQueue({ [weak self] in
-            self?.captureAndRestartEnhancedMode(reason: reason)
-        }) { return }
+            guard let self, self.configSyncReadbackIdentity == identity,
+                  self.wakeRecoveryGeneration == wakeGeneration else { return }
+            self.captureAndRestartEnhancedMode(reason: reason)
+        }) {
+            return
+        }
 
         let now = Date()
         guard now.timeIntervalSince(lastEnhancedModeRuntimeRecoveryTime) >=
@@ -3566,7 +3688,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        lastEnhancedModeRuntimeRecoveryTime = now
         automaticRecoveryTrigger = reason.hasPrefix("sustained core CPU:") ? "cpu-watchdog"
             : (reason.hasPrefix("runtime data plane failed") ? "data-plane" : "runtime-health")
         Logger.log("[Automatic Recovery] stage=request trigger=\(automaticRecoveryTrigger) generation=\(enhancedModeGeneration)", level: .warning)
@@ -3579,10 +3700,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self = self else { return }
             guard generation == self.enhancedModeGeneration, !self.isTerminating else { return }
             self.isEnhancedModeRuntimeRecoveryPending = false
+            guard self.configSyncReadbackIdentity == identity, self.wakeRecoveryGeneration == wakeGeneration,
+                  !self.isConfigUpdating, !self.isConfigUpdateQueued else {
+                Logger.log("Enhanced Mode recovery superseded by a runtime change")
+                return
+            }
             guard Settings.enhancedMode || ConfigManager.shared.isEnhancedModeActive,
                   !self.enhancedModeLifecycle.isTransitionInProgress,
                   !self.isWakeEnhancedModeRestarting else {
                 return
+            }
+            let restartTime = Date()
+            self.lastEnhancedModeRuntimeRecoveryTime = restartTime
+            if self.automaticRecoveryTrigger == "data-plane" {
+                self.lastEnhancedModeDataPlaneRecoveryTime = restartTime
             }
             Logger.log(
                 "Enhanced Mode runtime is unhealthy after confirmed checks; " +
@@ -3804,22 +3935,35 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         guard ConfigManager.shared.isEnhancedModeActive,
               expectedEnhancedDNSPort > 0,
               !isWakeEnhancedModeRestarting,
-              !isEnhancedModeRuntimeRecoveryPending else { return }
+              !isEnhancedModeRuntimeRecoveryPending,
+              let data = lastConfirmedEnhancedData,
+              let root = (try? Yams.load(yaml: String(decoding: data, as: UTF8.self))) as? [String: Any],
+              let dns = root["dns"] as? [String: Any],
+              let listen = dns["listen"] as? String,
+              let host = EnhancedDNSProbeTargetPolicy.host(from: listen) else { return }
         let port = expectedEnhancedDNSPort
+        let scope = runtimeConfigurationScope
         WakeRecoveryLadderDriver.run(ladder, hooks: WakeRecoveryLadderDriver.Hooks(
             port: port,
-            generation: { [unowned self] in self.wakeRecoveryGeneration },
+            generation: { [unowned self] in wakeRecoveryGeneration },
             probe: { [weak self] report in
                 DispatchQueue.global(qos: .utility).async {
-                    let responding = self?.expectedEnhancedDNSPortResponses(port) != nil
-                    DispatchQueue.main.async { report(responding) }
+                    let responding = Self.probeDNSListener(port: port, host: host)
+                    DispatchQueue.main.async {
+                        guard let self, self.runtimeConfigurationScope == scope,
+                              self.expectedEnhancedDNSPort == port else { report(nil); return }
+                        report(responding)
+                    }
                 }
             },
             reload: { [unowned self] done in
-                self.recordWakeRecoveryBreadcrumb("DNS listener silent; in-place reload")
-                self.updateConfig(showNotification: false, showError: false, completeHandler: done)
+                recordWakeRecoveryBreadcrumb("DNS listener silent; in-place reload")
+                updateConfig(showNotification: false, showError: false, completeHandler: done)
             },
-            restart: { [unowned self] reason in self.captureAndRestartEnhancedMode(reason: reason) },
+            restart: { [unowned self] reason in
+                guard runtimeConfigurationScope == scope, expectedEnhancedDNSPort == port else { return }
+                captureAndRestartEnhancedMode(reason: reason)
+            },
             log: { Logger.log("Wake recovery: \($0)", level: .warning) }
         ))
     }
@@ -3842,22 +3986,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private func runProxyPathRecovery(_ ladder: ProxyPathRecoveryLadder) {
         let configName = ConfigManager.selectConfigName
         ProxyPathRecoveryDriver.run(ladder, hooks: ProxyPathRecoveryDriver.Hooks(
-            generation: { [unowned self] in self.wakeRecoveryGeneration },
+            generation: { [unowned self] in wakeRecoveryGeneration },
             probe: { [unowned self] report in
-                self.proxyPathSampler.sample(configName: configName) { verdict, samples in
+                proxyPathSampler.sample(configName: configName) { verdict, samples in
                     let detail = samples.map { "\(BenchmarkProbeDiagnostic.safeNodeLabel($0.leaf))=\($0.failure.map { "\($0)" } ?? "ok")" }
                     let level: ClashLogLevel = (verdict == .healthy || verdict == .noSample) ? .info : .warning
                     Logger.log("[Proxy Path] verdict \(verdict): \(detail.isEmpty ? "no samples" : detail.joined(separator: ", "))", level: level)
                     report(verdict)
                 }
             },
-            flushDNSCache: { [unowned self] done in self.proxyPathSampler.flushDNSCache(completion: done) },
+            flushDNSCache: { [unowned self] done in proxyPathSampler.flushDNSCache(completion: done) },
             reloadConfig: { [unowned self] done in
-                guard !self.isConfigUpdating else { done("configuration update in progress"); return }
-                self.updateConfig(showNotification: false, showError: false, completeHandler: done)
+                guard !isConfigUpdating else { done("configuration update in progress"); return }
+                updateConfig(showNotification: false, showError: false, completeHandler: done)
             },
             after: { delay, block in DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: block) },
-            notify: { [unowned self] kind in self.notifyProxyPathFailure(kind) },
+            notify: { [unowned self] kind in notifyProxyPathFailure(kind) },
             log: { Logger.log("[Proxy Path] \($0)", level: .warning) }
         ))
     }
@@ -3987,7 +4131,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
               !ProxyGroupSelectionController.isAnyOperationInProgress else { return }
         if deferAutomaticRecoveryForModeQueue({ [weak self] in
             self?.restartEnhancedModeAfterWake(attemptsLeft: attemptsLeft)
-        }) { return }
+        }) {
+            return
+        }
         isWakeEnhancedModeRestarting = true
         cancelActiveSpeedTest(reason: "Enhanced Mode core recovery")
         let configName = ConfigManager.selectConfigName
@@ -4231,7 +4377,9 @@ extension AppDelegate {
         guard ownsRuntimeControl, !isEnhancedModeTransitionInProgress, !isConfigUpdating,
               !ProxyGroupSelectionController.isAnyOperationInProgress,
               !isTerminating, !isRestarting else { return }
-        if retryAutomaticRecoveryIfNeeded() { return }
+        if retryAutomaticRecoveryIfNeeded() {
+            return
+        }
         guard !isConfigUpdateQueued else { return }
         if startupCoreHandoffRetryAvailable, !ConfigManager.shared.isRunning {
             retryStartupCoreHandoff(resetRecoveryBudget: true)
@@ -4710,7 +4858,6 @@ extension AppDelegate {
             isCurrent: { [weak self] in self?.isCurrentClaudeLockChange(change) == true },
             applyRuntime: { [weak self] done in
                 guard let self else { done("Application unavailable."); return }
-                change.runtimeTouched = true
                 self.applyClaudeLockRuntime(change, completion: done)
             },
             applySystemProxy: { [weak self] done in
@@ -4724,6 +4871,7 @@ extension AppDelegate {
                 self.restoreClaudeLockRuntime(change, completion: done)
             },
             restoreSystemProxy: { [weak self] done in
+                guard change.runtimeTouched else { done(nil); return }
                 guard let self, let checkpoint = change.checkpoint else {
                     done("The original System Proxy checkpoint is unavailable."); return
                 }
@@ -4759,26 +4907,33 @@ extension AppDelegate {
                 // Enhanced handoffs that unnecessarily contend for port 7890.
                 reload()
             } else {
+                change.runtimeTouched = true
                 enableEnhancedMode { _, error in
                     guard self.isCurrentClaudeLockChange(change) else {
                         completion("Claude Proxy Lock change was superseded."); return
                     }
-                    if let error { completion(error); return }
+                    if let error {
+                        completion(error); return
+                    }
                     reload()
                 }
                 change.generation = enhancedModeGeneration
             }
         } else if isEnhancedModeCleanupRequired {
+            change.runtimeTouched = true
             disableEnhancedMode { _, error in
                 guard self.isCurrentClaudeLockChange(change) else {
                     completion("Claude Proxy Lock change was superseded."); return
                 }
-                if let error { completion(error); return }
+                if let error {
+                    completion(error); return
+                }
                 reload()
             }
             change.generation = enhancedModeGeneration
         } else {
             if !ConfigManager.shared.isRunning {
+                change.runtimeTouched = true
                 startProxy()
                 guard ConfigManager.shared.isRunning else {
                     completion("Could not start the built-in core to disable Claude Proxy Lock.")
@@ -4797,7 +4952,9 @@ extension AppDelegate {
             guard self.isCurrentClaudeLockChange(change) else {
                 completion("Claude Proxy Lock change was superseded."); return
             }
-            if let error { completion(error); return }
+            if let error {
+                completion(error); return
+            }
             self.enqueueOutboundModeChange(
                 mode: change.runtimeSettings.mode, source: .configReload, closeConnections: false
             ) { success in
@@ -4817,7 +4974,9 @@ extension AppDelegate {
                     guard self.isCurrentClaudeLockChange(change) else {
                         completion("Claude Proxy Lock recovery was superseded."); return
                     }
-                    if let error { completion(error); return }
+                    if let error {
+                        completion(error); return
+                    }
                     self.reloadClaudeLockRuntime(change, completion: completion)
                 }
                 change.generation = self.enhancedModeGeneration
@@ -4830,7 +4989,9 @@ extension AppDelegate {
                     completion(nil)
                     return
                 }
-                if !ConfigManager.shared.isRunning, change.wasRunning { self.startProxy() }
+                if !ConfigManager.shared.isRunning, change.wasRunning {
+                    self.startProxy()
+                }
                 guard ConfigManager.shared.isRunning else {
                     completion(change.wasRunning ? "Could not restore the original built-in core." : nil)
                     return
@@ -4847,15 +5008,21 @@ extension AppDelegate {
                     if let error {
                         // Never start a second core while stop ownership remains
                         // uncertain. The existing lifecycle guard owns that fence.
-                        if self.isEnhancedModeCleanupRequired { completion(error); return }
-                        if !change.wasEnhancedActive { completion(error); return }
+                        if self.isEnhancedModeCleanupRequired {
+                            completion(error); return
+                        }
+                        if !change.wasEnhancedActive {
+                            completion(error); return
+                        }
                     }
                     restore()
                 }
                 change.generation = self.enhancedModeGeneration
             } else if let block = self.enhancedModeOwnershipBlock {
                 self.reconcileUncertainEnhancedCoreOwnership(block) { error in
-                    if let error { completion(error); return }
+                    if let error {
+                        completion(error); return
+                    }
                     restore()
                 }
             } else {
@@ -4865,7 +5032,11 @@ extension AppDelegate {
         if change.wasEnhancedActive, ConfigManager.shared.isEnhancedModeActive,
            enhancedModeOwnershipBlock == nil {
             reloadClaudeLockRuntime(change) { error in
-                if error == nil { completion(nil) } else { restart() }
+                if error == nil {
+                    completion(nil)
+                } else {
+                    restart()
+                }
             }
         } else {
             restart()
@@ -4918,7 +5089,11 @@ extension AppDelegate {
             }
             guard success else {
                 let error = NSLocalizedString("Could not enable System Proxy.", comment: "")
-                if let completion { completion(error) } else { self.presentClaudeProxyLockApplyError(error) }
+                if let completion {
+                    completion(error)
+                } else {
+                    self.presentClaudeProxyLockApplyError(error)
+                }
                 return
             }
             if change == nil {
@@ -5366,7 +5541,9 @@ extension AppDelegate {
                         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: tempConfigPath)
                         let launchInfo = self.readCustomEnhancedModeLaunchInfo(configPath: tempConfigPath)
                         guard case let .success(port, _, dnsPort, proxyPorts) = launchInfo else {
-                            if case let .failure(error) = launchInfo { _ = preparationSettlement.finish(.failed(error)) }
+                            if case let .failure(error) = launchInfo {
+                                _ = preparationSettlement.finish(.failed(error))
+                            }
                             cleanupPreparationFiles(); return
                         }
                         if let error = RuntimeEndpointSet(apiPort: Int(port) ?? 0, dnsPort: dnsPort, proxyPorts: proxyPorts).validationError {
@@ -5383,7 +5560,9 @@ extension AppDelegate {
                             self.validateRuntimeCandidate(file: URL(fileURLWithPath: tempConfigPath), isCurrent: isCurrent) { error in
                                 cleanupSourceSnapshot()
                                 if let error {
-                                    if !preparationSettlement.finish(.failed(error)) { cleanupPreparationFiles() }
+                                    if !preparationSettlement.finish(.failed(error)) {
+                                        cleanupPreparationFiles()
+                                    }
                                 } else if !preparationSettlement.finish(.prepared(prepared)) {
                                     cleanupPreparationFiles()
                                 }
@@ -5546,6 +5725,9 @@ extension AppDelegate {
         // The bridge pins IPv6 to the fresh run/resume session. A checkpoint
         // from before Enhanced Mode may carry the previous preference.
         restored = RuntimeConfigReadbackPolicy.preservingBuiltInSessionIPv6(in: restored, confirmed: root)
+        var tun = restored["tun"] as? [String: Any] ?? [:]
+        tun["enable"] = false
+        restored["tun"] = tun
         restored["external-controller"] = address
         restored["secret"] = ConfigManager.shared.apiSecret
         let temporary = URL(fileURLWithPath: kConfigFolderPath).appendingPathComponent(".runtime-recovery-\(UUID().uuidString).yaml")
@@ -5702,7 +5884,9 @@ extension AppDelegate {
         runtimeConfigTransactions.invalidate()
         runtimeCoreSessionID = UUID()
         isCoreConfigSnapshotVerified = false
-        if let restoreError = restoreBuiltInRecoveryCheckpoint() { return restoreError }
+        if let restoreError = restoreBuiltInRecoveryCheckpoint() {
+            return restoreError
+        }
         guard confirmedRuntimeProfileName != nil else {
             Logger.log("[Runtime Checkpoint] stage=resume outcome=fenced baseline_kind=startup reason=no_verified_profile", level: .error)
             fenceFailedBuiltInRecovery()
@@ -5727,7 +5911,9 @@ extension AppDelegate {
             }
             return error
         }
-        if let resumeGate { return resumeGate.resume(resume) }
+        if let resumeGate {
+            return resumeGate.resume(resume)
+        }
         return resume()
     }
 
@@ -6547,10 +6733,6 @@ extension AppDelegate {
                         }
                         Logger.log(
                             "External core API/TUN ready but DNS readiness is unconfirmed on port \(context.dnsPort); " +
-                                "ownership=\(ownership), dnsProbe=\(dnsProbe)",
-                            level: .debug
-                        )
-                    } else {
                         Logger.log("External core API/TUN/interface is not ready", level: .debug)
                     }
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
@@ -6713,7 +6895,9 @@ extension AppDelegate {
                 finish("Enhanced Mode close cancelled: lifecycle changed")
                 return
             }
-            if let dnsError { finish(dnsError); return }
+            if let dnsError {
+                finish(dnsError); return
+            }
             timeline.mark("dns_restored")
             timeline.mark("stop_requested", detail: self.enhancedModeOwnershipBlock == nil ? "path=direct" : "path=ownership_reconcile")
             if let block = self.enhancedModeOwnershipBlock {
@@ -6756,8 +6940,8 @@ extension AppDelegate {
         }
         Logger.log("[Built-in Handoff] stage=profile_apply session=\(session) baseline_kind=\(RuntimeConfigBaselineKind(confirmedProfile: confirmedRuntimeProfileName).rawValue)")
         requestConfigUpdateApplyingRuntimePatch(configName: selectedConfig,
-                                               portHandoffDeadline: portHandoffDeadline, handoffIsCurrent: scopeIsCurrent,
-                                               baselineState: { validatedBaselineID = $0 }) { [weak self] error in
+                                                portHandoffDeadline: portHandoffDeadline, handoffIsCurrent: scopeIsCurrent,
+                                                baselineState: { validatedBaselineID = $0 }) { [weak self] error in
             guard let self, scopeIsCurrent() else {
                 completion("Built-in profile handoff cancelled: lifecycle changed")
                 return
@@ -6770,7 +6954,9 @@ extension AppDelegate {
             guard completeProfile else {
                 let reason = RuntimeConfigApplyDiagnostics.displayReason(error ?? "The selected profile was not verified")
                 Logger.log("[Built-in Handoff] stage=profile_apply outcome=fenced session=\(session) baseline_kind=\(RuntimeConfigBaselineKind(confirmedProfile: self.confirmedRuntimeProfileName).rawValue) snapshot_verified=\(self.isCoreConfigSnapshotVerified) transaction_uncertain=\(self.runtimeConfigTransactions.isUncertain) reason=\(reason)", level: .error)
-                if let error { Self.logPortConflictOwner(error) }
+                if let error {
+                    Self.logPortConflictOwner(error)
+                }
                 self.fenceFailedBuiltInRecovery()
                 completion("Built-in profile recovery failed; the incomplete core was stopped. \(reason)")
                 return
@@ -6956,6 +7142,18 @@ extension AppDelegate {
               let listen = dns["listen"] as? String,
               let host = EnhancedDNSProbeTargetPolicy.host(from: listen) else { return "127.0.0.1" }
         return host
+    }
+
+    private static func probeDNSListener(port: Int, host: String) -> Bool {
+        let transactionID = UInt16.random(in: UInt16.min ... UInt16.max)
+        let request = EnhancedModeDNSReadinessPolicy.listenerStatusQuery(transactionID: transactionID)
+        for type in [SOCK_DGRAM, SOCK_STREAM] {
+            guard let reply = BoundedDNSProbe.query(host: host, port: port, type: type, payload: request),
+                  EnhancedModeDNSReadinessPolicy.isListenerStatusResponse(reply, transactionID: transactionID) else {
+                return false
+            }
+        }
+        return true
     }
 
     private func expectedEnhancedDNSPortResponses(
@@ -7175,7 +7373,7 @@ extension AppDelegate {
             if let text = try? String(contentsOfFile: kDefaultConfigFilePath, encoding: .utf8),
                let root = (try? Yams.load(yaml: text)) as? [String: Any] {
                 endpoints.formUnion(RuntimePortHandoffWaiter.bootstrapEndpoints(in: root, proxyPortOverride: portOverride,
-                                                                              allowLANOverride: allowLANOverride))
+                                                                                allowLANOverride: allowLANOverride))
             }
             if let checkpoint, let text = String(data: checkpoint, encoding: .utf8),
                let root = (try? Yams.load(yaml: text)) as? [String: Any] {
@@ -7215,17 +7413,17 @@ extension AppDelegate {
         let labels = Set(endpoints.map { "\($0.port)/\($0.transport.rawValue)" }).sorted().joined(separator: ",")
         let started = ProcessInfo.processInfo.systemUptime
         RuntimePortHandoffWaiter.wait(for: endpoints, deadline: deadline, isCurrent: isCurrent,
-            onWaiting: { ports in
-                Logger.log("[Port Handoff] stage=\(stage) outcome=waiting ports=\(ports) requested=\(labels)", level: .warning)
-            }) { error in
-                let elapsed = Int((ProcessInfo.processInfo.systemUptime - started) * 1_000)
-                if let error {
-                    Logger.log("[Port Handoff] stage=\(stage) outcome=failed elapsed_ms=\(elapsed) reason=\(RuntimeConfigApplyDiagnostics.sanitize(error))", level: .error)
-                } else {
-                    Logger.log("[Port Handoff] stage=\(stage) outcome=bind_ready elapsed_ms=\(elapsed) requested=\(labels)")
-                }
-                completion(error)
+                                      onWaiting: { ports in
+                                          Logger.log("[Port Handoff] stage=\(stage) outcome=waiting ports=\(ports) requested=\(labels)", level: .warning)
+                                      }) { error in
+            let elapsed = Int((ProcessInfo.processInfo.systemUptime - started) * 1_000)
+            if let error {
+                Logger.log("[Port Handoff] stage=\(stage) outcome=failed elapsed_ms=\(elapsed) reason=\(RuntimeConfigApplyDiagnostics.sanitize(error))", level: .error)
+            } else {
+                Logger.log("[Port Handoff] stage=\(stage) outcome=bind_ready elapsed_ms=\(elapsed) requested=\(labels)")
             }
+            completion(error)
+        }
     }
 
     private func dnsHelperClient() -> TunDNSHelperClient? {
@@ -7235,11 +7433,15 @@ extension AppDelegate {
                 let invocation: Void? = helper.captureDNS?(filterInterface: filterInterface) { info in
                     reply(info as? [String: Any] ?? ["error": "DNS capture returned no snapshot"])
                 }
-                if invocation == nil { reply(["error": "Installed helper does not support transactional DNS capture"]) }
+                if invocation == nil {
+                    reply(["error": "Installed helper does not support transactional DNS capture"])
+                }
             },
             apply: { snapshot, servers, reply in
                 let invocation: Void? = helper.applyDNS?(snapshot: snapshot, servers: servers, reply: reply)
-                if invocation == nil { reply("Installed helper does not support transactional DNS apply") }
+                if invocation == nil {
+                    reply("Installed helper does not support transactional DNS apply")
+                }
             },
             restore: { snapshot, reply in
                 let invocation: Void? = helper.getHelperProtocolVersion? { version in
@@ -7252,7 +7454,9 @@ extension AppDelegate {
                     }
                     helper.restoreDNS(withSavedInfo: snapshot, filterInterface: Settings.filterInterface, reply: reply)
                 }
-                if invocation == nil { reply("Cannot verify the DNS helper protocol; recovery journal retained") }
+                if invocation == nil {
+                    reply("Cannot verify the DNS helper protocol; recovery journal retained")
+                }
             },
             flush: { reply in helper.flushDNSCache(reply: reply) }
         )
@@ -7358,7 +7562,9 @@ extension AppDelegate {
                 completion("ClashFX cleanup was cancelled")
                 return
             }
-            if let dnsError { completion(dnsError); return }
+            if let dnsError {
+                completion(dnsError); return
+            }
             self.reconcileUncertainEnhancedCoreOwnership(
                 ownershipBlock,
                 allowTerminating: true
@@ -7463,7 +7669,9 @@ extension AppDelegate {
 
         if hasSavedDNSInfo {
             restoreDNSAfterTun { [weak self] error in
-                if let error { finishAttempt(.failed(error)); return }
+                if let error {
+                    finishAttempt(.failed(error)); return
+                }
                 self?.cleanupStaleMihomoCoreOnLaunch(attemptsLeft: attemptsLeft, completion: completion)
             }
             return
@@ -7589,7 +7797,9 @@ extension AppDelegate {
         }
         guard didCompleteStaleEnhancedCoreCleanup else {
             Logger.log("[Startup Configuration] stage=local_activation outcome=waiting reason=stale_core_cleanup")
-            if startupCoreHandoffRetryAvailable { retryStartupCoreHandoff(resetRecoveryBudget: true) }
+            if startupCoreHandoffRetryAvailable {
+                retryStartupCoreHandoff(resetRecoveryBudget: true)
+            }
             return true
         }
         Logger.log("[Startup Configuration] stage=local_activation outcome=loading")
@@ -7665,7 +7875,9 @@ extension AppDelegate {
               !isStartupCoreHandoffRetryInProgress,
               !isTerminating,
               !isRestarting else { return }
-        if resetRecoveryBudget { startupCoreRecovery.begin() }
+        if resetRecoveryBudget {
+            startupCoreRecovery.begin()
+        }
         startupCoreRecovery.cancelPending()
         isStartupCoreHandoffRetryInProgress = true
         enhancedModeMenuItem.isEnabled = false
@@ -7800,7 +8012,8 @@ extension AppDelegate {
             let current: () -> Bool = { [weak self] in
                 guard let self else { return false }
                 return self.enhancedModeLifecycle.isCurrentRestore(
-                    restoreGeneration, isTerminating: self.isTerminating) && !self.isRestarting
+                    restoreGeneration, isTerminating: self.isTerminating
+                ) && !self.isRestarting
             }
             clashSuspendCore()
             waitForBuiltInProxyPort(isCurrent: current) { [weak self] handoffError in
@@ -7865,7 +8078,9 @@ extension AppDelegate {
         if automaticRecoverySelections != nil {
             automaticRecoveryNeedsRetry = true
             Settings.enhancedMode = true
-            if enhancedModeOwnershipBlock == nil { ConfigManager.shared.isRunning = false }
+            if enhancedModeOwnershipBlock == nil {
+                ConfigManager.shared.isRunning = false
+            }
             enhancedModeMenuItem.isEnabled = true
             enhancedModeMenuItem.state = .mixed
             enhancedModeRuntimeHealthSummary = "recovery failed; proxy selection checkpoint retained"
@@ -7979,6 +8194,7 @@ extension AppDelegate {
         closeConnections: Bool,
         completion: ((Bool) -> Void)? = nil
     ) {
+        aiFailoverRuntime?.supervisor.invalidate(reason: "代理模式正在切换", stabilization: 10)
         outboundModeRequestSequence &+= 1
         let request = OutboundModeChangeRequest(
             id: outboundModeRequestSequence,
@@ -8033,7 +8249,9 @@ extension AppDelegate {
         }
 
         if success {
-            if claudeLockChange == nil { ConfigManager.selectOutBoundMode = request.mode }
+            if claudeLockChange == nil {
+                ConfigManager.selectOutBoundMode = request.mode
+            }
             let config = ConfigManager.shared.currentConfig?.copy()
             config?.mode = request.mode
             ConfigManager.shared.currentConfig = config
@@ -8121,7 +8339,9 @@ extension AppDelegate {
         ) { [weak self] success in
             guard let self else { return }
             self.userSystemProxyChangeInProgress = false
-            if success { ConfigManager.shared.proxyPortAutoSet = true }
+            if success {
+                ConfigManager.shared.proxyPortAutoSet = true
+            }
             self.requestSystemProxyAutoRecovery()
         }
     }
@@ -8133,7 +8353,9 @@ extension AppDelegate {
         SystemProxyManager.shared.disableProxy(result: { [weak self] success in
             guard let self else { return }
             self.userSystemProxyChangeInProgress = false
-            if success { ConfigManager.shared.proxyPortAutoSet = false }
+            if success {
+                ConfigManager.shared.proxyPortAutoSet = false
+            }
             self.requestSystemProxyAutoRecovery()
         })
     }
@@ -8618,7 +8840,9 @@ extension AppDelegate {
             UserDefaults.standard.register(defaults: ["NSApplicationCrashOnExceptions": false])
             let x = UserDefaults.standard
             var launch_fail_times = 0
-            if let xx = x.object(forKey: "launch_fail_times") as? Int { launch_fail_times = xx }
+            if let xx = x.object(forKey: "launch_fail_times") as? Int {
+                launch_fail_times = xx
+            }
             launch_fail_times += 1
             x.set(launch_fail_times, forKey: "launch_fail_times")
             if launch_fail_times > 3 {
@@ -8675,8 +8899,12 @@ extension AppDelegate {
         selectionMemoryRestoration = restoration
         restoration.restore(records: records) { [weak self, weak restoration] didRestore in
             guard let self else { return }
-            if self.selectionMemoryRestoration === restoration { self.selectionMemoryRestoration = nil }
-            if didRestore, isCurrent() { ConnectionManager.closeAllConnection() }
+            if self.selectionMemoryRestoration === restoration {
+                self.selectionMemoryRestoration = nil
+            }
+            if didRestore, isCurrent() {
+                ConnectionManager.closeAllConnection()
+            }
             completion?(didRestore && isCurrent())
         }
     }
@@ -8720,7 +8948,9 @@ extension AppDelegate {
         let scope = runtimeConfigurationScope
         ApiRequest.updateAllowLan(allow: ConfigManager.allowConnectFromLan) { [weak self] succeeded in
             guard let self, self.runtimeConfigurationScope == scope else { return }
-            if !succeeded { self.isCoreConfigSnapshotVerified = false }
+            if !succeeded {
+                self.isCoreConfigSnapshotVerified = false
+            }
             self.syncConfig()
         }
     }
@@ -8804,7 +9034,9 @@ extension AppDelegate: NSMenuItemValidation {
                 #selector(actionSwitchProxyMode(_:)), #selector(actionAllowFromLan(_:)),
                 #selector(actionToggleBypassChineseApps(_:)), #selector(actionUpdateConfig(_:))
             ]
-            if blockedDuringLock.contains(action) { return false }
+            if blockedDuringLock.contains(action) {
+                return false
+            }
         }
 
         // Bypass Common Chinese Apps relies on PROCESS-NAME rules,

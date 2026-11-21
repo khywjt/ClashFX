@@ -16,7 +16,7 @@ struct WakeRecoveryLadder {
         case abandon
     }
 
-    private let generation: Int
+    let generation: Int
     private var reloadAttempted = false
 
     init(generation: Int) {
@@ -29,7 +29,9 @@ struct WakeRecoveryLadder {
     mutating func nextStep(currentGeneration: Int, dnsListenerResponding: Bool?) -> Step {
         guard currentGeneration == generation else { return .abandon }
         guard dnsListenerResponding == false else { return .finish }
-        if reloadAttempted { return .restartEnhancedMode }
+        if reloadAttempted {
+            return .restartEnhancedMode
+        }
         reloadAttempted = true
         return .reloadConfig
     }
@@ -60,10 +62,9 @@ enum WakeRecoveryLadderDriver {
             case .reloadConfig:
                 hooks.log("DNS listener on port \(hooks.port) is silent; reloading the confirmed configuration in place")
                 hooks.reload { error in
+                    guard hooks.generation() == ladder.generation else { return }
                     if let error = error {
-                        hooks.log("in-place reload failed (\(error)); rebuilding Enhanced Mode")
-                        hooks.restart("wake DNS listener reload failed")
-                        return
+                        hooks.log("in-place reload failed (\(error)); checking DNS listener again")
                     }
                     run(ladder, hooks: hooks)
                 }

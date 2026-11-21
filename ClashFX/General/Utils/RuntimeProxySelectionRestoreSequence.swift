@@ -100,7 +100,9 @@ enum AutomaticRecoverySelectionPolicy {
     ) throws -> [String: String] {
         guard let snapshotData else {
             var requiredKeys = expectedSelectors
-            if requireGlobal { requiredKeys.insert("GLOBAL") }
+            if requireGlobal {
+                requiredKeys.insert("GLOBAL")
+            }
             guard requiredKeys.allSatisfy({ saved[$0] != nil }) else {
                 throw CheckpointError.unavailableCheckpointIncomplete
             }
@@ -155,7 +157,9 @@ enum AutomaticRecoverySelectionPolicy {
             let selector = Selector(name: name, now: now, all: all)
             guard all.allSatisfy({ candidate in
                 guard !candidate.isEmpty else { return false }
-                if Self.isCompatibilityFallback(candidate, in: rawProxies) { return true }
+                if Self.isCompatibilityFallback(candidate, in: rawProxies) {
+                    return true
+                }
                 return snapshot.isSelectable(group: name, target: candidate)
             }), snapshot.isSelectable(group: name, target: now) else {
                 throw CheckpointError.malformedSnapshot
@@ -164,7 +168,9 @@ enum AutomaticRecoverySelectionPolicy {
         }
 
         var requiredSelectors = expectedSelectors
-        if requireGlobal { requiredSelectors.insert("GLOBAL") }
+        if requireGlobal {
+            requiredSelectors.insert("GLOBAL")
+        }
         guard requiredSelectors.allSatisfy({ selectors[$0] != nil }) else {
             throw CheckpointError.requiredSelectorMissing
         }
@@ -197,7 +203,9 @@ enum AutomaticRecoverySelectionPolicy {
     }
 
     private static func isCompatibilityFallback(_ name: String, in proxies: [String: Any]) -> Bool {
-        if name == "COMPATIBLE" { return true }
+        if name == "COMPATIBLE" {
+            return true
+        }
         guard let value = proxies[name] as? [String: Any] else { return false }
         return value["type"] as? String == "Compatible"
     }
@@ -213,7 +221,9 @@ enum AutomaticRecoverySelectionPolicy {
                   let type = value["type"] as? String else {
                 return false
             }
-            if type == "Direct" { return true }
+            if type == "Direct" {
+                return true
+            }
             // An automatic group's current Direct result is core authority,
             // not evidence that a manual Selector fell back to its first item.
             guard type == "Selector", let all = value["all"] as? [String],

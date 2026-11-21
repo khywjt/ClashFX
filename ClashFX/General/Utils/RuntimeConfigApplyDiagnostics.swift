@@ -96,7 +96,7 @@ enum RuntimeConfigApplyDiagnostics {
             return String("[diagnostic redaction unavailable]".prefix(limit))
         }
         let source = text as NSString
-        let urlRanges = urlPattern.matches(in: text, range: NSRange(location: 0, length: source.length)).map { $0.range }
+        let urlRanges = urlPattern.matches(in: text, range: NSRange(location: 0, length: source.length)).map(\.range)
         let credentialsRedacted = redactCredentialValues(in: text, pattern: credentialKeyPattern, urlRanges: urlRanges)
         let safe = replacingURLs(in: credentialsRedacted, pattern: urlPattern)
 
@@ -168,8 +168,12 @@ enum RuntimeConfigApplyDiagnostics {
         for match in matches where match.range.location >= cursor {
             // A token/username query inside a URL is handled by URL redaction,
             // not mistaken for an unquoted scalar that swallows the next error.
-            while urlIndex < urlRanges.count, NSMaxRange(urlRanges[urlIndex]) <= match.range.location { urlIndex += 1 }
-            if urlIndex < urlRanges.count, NSLocationInRange(match.range.location, urlRanges[urlIndex]) { continue }
+            while urlIndex < urlRanges.count, NSMaxRange(urlRanges[urlIndex]) <= match.range.location {
+                urlIndex += 1
+            }
+            if urlIndex < urlRanges.count, NSLocationInRange(match.range.location, urlRanges[urlIndex]) {
+                continue
+            }
             let start = NSMaxRange(match.range)
             result += source.substring(with: NSRange(location: cursor, length: start - cursor))
             result += "[redacted]"
@@ -210,7 +214,9 @@ enum RuntimeConfigApplyDiagnostics {
                 start -= 1
             }
             let prefix = source.substring(with: NSRange(location: start, length: key - start))
-            if prefix.trimmingCharacters(in: .whitespaces) == "-" { return key - start }
+            if prefix.trimmingCharacters(in: .whitespaces) == "-" {
+                return key - start
+            }
             return prefix.prefix { $0 == " " || $0 == "\t" }.count
         }
 
@@ -276,7 +282,9 @@ enum RuntimeConfigApplyDiagnostics {
                 } else if character == 93 || character == 125 {
                     guard closers.last == character else { return source.length }
                     closers.removeLast()
-                    if closers.isEmpty { return index + 1 }
+                    if closers.isEmpty {
+                        return index + 1
+                    }
                     expectsNode = false
                     plain = false
                     nodeClosed = true
@@ -335,7 +343,9 @@ enum RuntimeConfigApplyDiagnostics {
             var end = start
             let numberCharacters: [unichar] = [43, 45, 46, 69, 101]
             while end < source.length,
-                  (48 ... 57).contains(source.character(at: end)) || numberCharacters.contains(source.character(at: end)) { end += 1 }
+                  (48 ... 57).contains(source.character(at: end)) || numberCharacters.contains(source.character(at: end)) {
+                end += 1
+            }
             guard end == source.length || boundaries.contains(source.character(at: end)) else { return false }
             return Double(source.substring(with: NSRange(location: start, length: end - start))) != nil
         }
@@ -344,14 +354,20 @@ enum RuntimeConfigApplyDiagnostics {
         /// not confuse an unindented quoted YAML peer key with that value.
         private func flowValueStart(after start: Int) -> Int {
             var next = start
-            while next < source.length, [9, 10, 13, 32].contains(source.character(at: next)) { next += 1 }
+            while next < source.length, [9, 10, 13, 32].contains(source.character(at: next)) {
+                next += 1
+            }
             guard next > start, next < source.length else { return start }
             let character = source.character(at: next)
             if isQuote(character) {
                 let end = quotedEnd(at: next)
                 var suffix = end
-                while suffix < source.length, [9, 32].contains(source.character(at: suffix)) { suffix += 1 }
-                if suffix < source.length, source.character(at: suffix) == 58 { return start }
+                while suffix < source.length, [9, 32].contains(source.character(at: suffix)) {
+                    suffix += 1
+                }
+                if suffix < source.length, source.character(at: suffix) == 58 {
+                    return start
+                }
                 return next
             }
             if character == 91 || character == 123 || isJSONPrimitive(at: next) {
@@ -371,7 +387,9 @@ enum RuntimeConfigApplyDiagnostics {
             }
             if isQuote(character) {
                 var end = quotedEnd(at: start)
-                while end < source.length, isQuote(source.character(at: end)) { end = quotedEnd(at: end) }
+                while end < source.length, isQuote(source.character(at: end)) {
+                    end = quotedEnd(at: end)
+                }
                 guard hasValueBoundary(after: end, allowColon: false) else {
                     return continuationEnd(after: lineEnd(from: end), indentation: indentation(before: keyStart))
                 }

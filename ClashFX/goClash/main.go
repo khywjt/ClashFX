@@ -404,7 +404,7 @@ func retargetEnhancedDNSConfigFile(configPath string, port int) error {
 			return err
 		}
 	}
-	encoded, err := yaml.Marshal(rawMap)
+	encoded, err := marshalYAMLForYams(rawMap)
 	if err != nil {
 		return err
 	}
@@ -1204,6 +1204,8 @@ func parseDefaultConfigThenStart(checkPort, allowLan, ipv6 bool, proxyPort uint3
 			tunMu.Unlock()
 			return nil, err
 		}
+	} else {
+		rawCfg.Tun.Enable = false
 	}
 	tunMu.Unlock()
 
@@ -1211,7 +1213,7 @@ func parseDefaultConfigThenStart(checkPort, allowLan, ipv6 bool, proxyPort uint3
 	if err != nil {
 		return nil, err
 	}
-	submittedConfig, err := yaml.Marshal(rawCfg)
+	submittedConfig, err := marshalYAMLForYams(rawCfg)
 	if err != nil {
 		return nil, err
 	}
@@ -1474,7 +1476,7 @@ func clashConvertShareLinks(content *C.char) *C.char {
 		},
 	}
 
-	data, err := yaml.Marshal(rawMap)
+	data, err := marshalYAMLForYams(rawMap)
 	if err != nil {
 		return C.CString("error:" + err.Error())
 	}
@@ -1606,7 +1608,26 @@ func updateConfigAtEpoch(configPath string, epoch uint64) *C.char {
 		return C.CString(err.Error())
 	}
 	if err := applyActiveConfigUpdate(currentCacheDBLifecycle(), epoch, func() error {
-		cfg, err := executor.ParseWithBytes(raw)
+		rawCfg, err := config.UnmarshalRawConfig(raw)
+		if err != nil {
+			return err
+		}
+		tunMu.Lock()
+		if tunEnabled {
+			applyTunConfig(rawCfg)
+			if err := applyTunRouteExclusions(rawCfg); err != nil {
+				tunMu.Unlock()
+				return err
+			}
+		} else {
+			rawCfg.Tun.Enable = false
+		}
+		tunMu.Unlock()
+		cfg, err := config.ParseRawConfig(rawCfg)
+		if err != nil {
+			return err
+		}
+		raw, err = marshalYAMLForYams(rawCfg)
 		if err != nil {
 			return err
 		}
@@ -1973,7 +1994,7 @@ func writeEnhancedConfig(configPath, outputPath, excludeRaw string, mtuParam uin
 	}
 	prependUniqueRules(rawMap, enhancedCoreProcessDirectRules)
 
-	data, err := yaml.Marshal(rawMap)
+	data, err := marshalYAMLForYams(rawMap)
 	if err != nil {
 		return C.CString("error:" + err.Error())
 	}
