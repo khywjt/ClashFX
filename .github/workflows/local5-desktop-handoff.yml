@@ -20,7 +20,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          fetch-depth: 4
+          fetch-depth: 16
           persist-credentials: false
       - uses: ruby/setup-ruby@v1
         with:

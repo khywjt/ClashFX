@@ -82,8 +82,12 @@ def api(path):
         client.close()
 
 
-def profile(tcp):
-    hijack = '["any:53", "tcp://any:53"]' if tcp else '["udp://any:53"]'
+def profile(expected_dns):
+    # The TUN core hijacks both transports at each listed address, regardless of
+    # the scheme. Exercise a real DNS handoff failure by moving the TUN DNS peer.
+    address = "198.18.0.1/30" if expected_dns else "198.19.0.1/30"
+    hijack = "198.18.0.2:53" if expected_dns else "198.19.0.2:53"
+    reject_unowned = "" if expected_dns else "  - IP-CIDR,198.18.0.2/32,REJECT,no-resolve"
     return f"""mixed-port: {PROXY_PORT}
 allow-lan: false
 bind-address: 127.0.0.1
@@ -98,7 +102,8 @@ tun:
   stack: system
   auto-route: true
   auto-detect-interface: true
-  dns-hijack: {hijack}
+  inet4-address: ["{address}"]
+  dns-hijack: ["{hijack}"]
 dns:
   enable: true
   listen: 127.0.0.1:{DNS_PORT}
@@ -111,6 +116,7 @@ proxies:
 proxy-groups:
   - {{name: {SELECTOR}, type: select, proxies: [DIRECT, {CHOICE}]}}
 rules:
+{reject_unowned}
   - IP-CIDR,127.0.0.0/8,DIRECT,no-resolve
   - MATCH,DIRECT
 """
@@ -219,8 +225,8 @@ function run(argv) {
         assert run("/usr/bin/defaults", "read", APP_ID, "claudeProxyLockTarget").stdout.strip() == PIN
         app_pid = upgrade.process_at(app / "Contents/MacOS/ClashFX")[0][0]
         core_pid = upgrade.process_at(upgrade.CORE)[0][0]
-        utun = api("/configs")["tun"]["device"]
-        assert utun.startswith("utun")
+        route = run("/sbin/route", "-n", "get", upgrade.TUN_DNS).stdout
+        utun = re.search(r"^\s*interface:\s*(utun\d+)\s*$", route, re.M)[1]
         answers = run("/usr/bin/dscacheutil", "-q", "host", "-a", "name",
                       f"local5-fixture-{core_pid}.example.com", timeout=10).stdout
         addresses = re.findall(r"ip_address:\s*(\d+\.\d+\.\d+\.\d+)", answers)
@@ -278,9 +284,10 @@ def main():
         parser.add_argument("--" + option, required=True, type=Path)
     args = parser.parse_args()
     failures, uid = hosted.hosted_runner_gate()
-    assert failures == ["effective uid must be 0"] and uid > 0 and Path.home() == Path("/Users/runner"), failures
-    assert os.environ["GITHUB_REPOSITORY"] == "khywjt/ClashFX"
-    assert os.environ["GITHUB_REF"] == "refs/heads/codex/local5-full-handoff-20261121"
+    if (failures != ["effective uid must be 0"] or uid <= 0 or Path.home() != Path("/Users/runner")
+            or os.environ.get("GITHUB_REPOSITORY") != "khywjt/ClashFX"
+            or os.environ.get("GITHUB_REF") != "refs/heads/codex/local5-full-handoff-20261121"):
+        raise SystemExit(f"This fixture requires the dedicated hosted macOS guest: {failures}")
     sudo("/usr/bin/true")
     hosted.verify_clean_guest_before_mutation()
     assert not APP.exists() and not (Path.home() / ".config/clashfx").exists()
