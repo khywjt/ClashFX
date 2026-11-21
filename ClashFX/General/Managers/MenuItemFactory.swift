@@ -420,6 +420,7 @@ class MenuItemFactory {
         let model = SavedProxyModel(group: group, selected: name, config: configName)
         ConfigManager.selectedProxyRecords.removeAll { $0.key == model.key }
         ConfigManager.selectedProxyRecords.append(model)
+        AppDelegate.shared.refreshEnhancedRecoveryCheckpoint()
     }
 
     @discardableResult

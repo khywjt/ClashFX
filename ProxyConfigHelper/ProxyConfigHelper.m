@@ -106,6 +106,7 @@ ProxyConfigRemoteProcessProtocol
 @implementation ProxyConfigHelper
 
 static const NSTimeInterval kMihomoGracefulStopTimeout = 2.0;
+static const NSTimeInterval kMihomoForcedStopReapTimeout = 4.0;
 static const NSTimeInterval kMihomoSocketQueryTimeout = 0.30;
 static const NSTimeInterval kMihomoSocketKnownCacheLifetime = 2.0;
 static const NSTimeInterval kMihomoSocketUnknownCacheLifetime = 0.35;
@@ -838,7 +839,11 @@ static BOOL RunTaskWithTimeout(NSString *executablePath,
 }
 
 - (BOOL)isMihomoTaskExitConfirmed:(NSTask *)task {
-    return !task.isRunning;
+    if (!task.isRunning) {
+        return YES;
+    }
+    pid_t pid = task.processIdentifier;
+    return pid > 0 && kill(pid, 0) == -1 && errno == ESRCH;
 }
 
 - (NSString *)newMihomoLaunchID {
@@ -1356,10 +1361,15 @@ static BOOL RunTaskWithTimeout(NSString *executablePath,
             usleep(100 * 1000);
         }
 
-        if (task.isRunning) {
+        if (task.isRunning && ![self isMihomoTaskExitConfirmed:task]) {
             NSLog(@"[mihomo_core] Graceful stop timed out; force killing pid %d", pid);
             (void)kill(pid, SIGKILL);
-            ClashFXWaitForTaskExit(task, kClashFXTaskKillReapTimeout);
+        }
+
+        NSTimeInterval reapDeadline = NSProcessInfo.processInfo.systemUptime + kMihomoForcedStopReapTimeout;
+        while (![self isMihomoTaskExitConfirmed:task] &&
+               NSProcessInfo.processInfo.systemUptime < reapDeadline) {
+            usleep(50 * 1000);
         }
 
         BOOL exitConfirmed = [self isMihomoTaskExitConfirmed:task];

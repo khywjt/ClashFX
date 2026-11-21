@@ -1,4 +1,67 @@
+import CryptoKit
 import Foundation
+
+/// The last verified selector graph, bound to the freshly rendered profile policy.
+struct EnhancedRecoveryCheckpoint: Codable {
+    struct Binding: Codable, Equatable {
+        let profile: String
+        let policyDigest: String
+        var mode: String
+        let usesCustomConfig: Bool
+        let claudeLockTarget: String?
+    }
+
+    private static let schemaVersion = 2
+    private static let maximumSize = 512 * 1024
+
+    private let version: Int
+    let binding: Binding
+    let selections: [String: String]
+
+    init(binding: Binding, selections: [String: String]) {
+        version = Self.schemaVersion
+        self.binding = binding
+        self.selections = selections
+    }
+
+    static func digest(_ bytes: Data) -> String {
+        SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+    }
+
+    func matching(_ current: Binding?) -> [String: String]? {
+        guard let current, version == Self.schemaVersion, binding == current,
+              selections.allSatisfy({ !$0.key.isEmpty && !$0.value.isEmpty }) else { return nil }
+        return selections
+    }
+
+    static func load(from file: URL) -> Self? {
+        guard let values = try? file.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey, .isSymbolicLinkKey]),
+              values.isRegularFile == true, values.isSymbolicLink != true,
+              let size = values.fileSize, size <= maximumSize,
+              let data = try? Data(contentsOf: file), data.count <= maximumSize,
+              let checkpoint = try? JSONDecoder().decode(Self.self, from: data),
+              checkpoint.matching(checkpoint.binding) != nil else { return nil }
+        return checkpoint
+    }
+
+    func save(to file: URL) throws {
+        let data = try JSONEncoder().encode(self)
+        guard data.count <= Self.maximumSize else { throw CocoaError(.fileWriteOutOfSpace) }
+        let directory = file.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
+                                                attributes: [.posixPermissions: 0o700])
+        let temporary = directory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        guard FileManager.default.createFile(atPath: temporary.path, contents: data,
+                                             attributes: [.posixPermissions: 0o600]) else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+        // Install the private temporary file atomically, also when replacing an old snapshot.
+        guard rename(temporary.path, file.path) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+    }
+}
 
 struct RuntimeProxySelectionPolicy {
     struct Proxy {

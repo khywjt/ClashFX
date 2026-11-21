@@ -1,0 +1,81 @@
+name: local.5 full desktop handoff
+
+on:
+  push:
+    branches:
+      - codex/local5-full-handoff-20261121
+
+permissions:
+  contents: read
+
+concurrency:
+  group: local5-full-handoff
+  cancel-in-progress: false
+
+jobs:
+  desktop:
+    if: github.repository == 'khywjt/ClashFX'
+    runs-on: macos-26
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 4
+          persist-credentials: false
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+          bundler-cache: true
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.1'
+          cache-dependency-path: ClashFX/goClash/go.sum
+      - name: Prepare dependencies from the public release sources
+        env:
+          GOMAXPROCS: '3'
+        run: bash install_dependency.sh
+      - name: Build the paired signed local.4 and local.5 Apps
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/local4" "$RUNNER_TEMP/local5"
+          build_app() {
+            xcodebuild -workspace ClashFX.xcworkspace -scheme ClashFX \
+              -configuration Release -destination "platform=macOS,arch=$(uname -m)" \
+              -derivedDataPath "$RUNNER_TEMP/local5-build" -jobs 3 \
+              ARCHS="$(uname -m)" ONLY_ACTIVE_ARCH=YES MACOSX_DEPLOYMENT_TARGET=13.0 \
+              CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM= \
+              ENABLE_HARDENED_RUNTIME=NO CLASHFX_SKIP_FORMAT=YES build > "$RUNNER_TEMP/$1-build.log" 2>&1 ||
+                { grep -E 'error:|BUILD FAILED' "$RUNNER_TEMP/$1-build.log" | tail -40; return 1; }
+            app="$RUNNER_TEMP/local5-build/Build/Products/Release/ClashFX.app"
+            /usr/bin/codesign --verify --deep --strict "$app"
+            /usr/bin/ditto "$app" "$RUNNER_TEMP/$1/ClashFX.app"
+          }
+          build_app local5
+          files=(
+            ClashFX/AppDelegate.swift
+            ClashFX/General/Managers/MenuItemFactory.swift
+            ClashFX/General/Managers/TunDNSTransactionController.swift
+            ClashFX/General/Utils/RuntimeProxySelectionRestoreSequence.swift
+            ClashFX/Info.plist
+            ProxyConfigHelper/ProxyConfigHelper.m
+          )
+          local_four="$(git log --format=%H --grep='test: rebuild local.4 baseline' -1)"
+          test -n "$local_four"
+          git restore --source="$local_four" -- "${files[@]}"
+          build_app local4
+          git restore --source="$GITHUB_SHA" -- "${files[@]}"
+      - name: Run real App, Helper, TUN DNS, cold-start recovery and failure rollback
+        run: |
+          python3 scripts/accept-local5-desktop-handoff.py \
+            --old "$RUNNER_TEMP/local4/ClashFX.app" \
+            --candidate "$RUNNER_TEMP/local5/ClashFX.app" \
+            --report "$RUNNER_TEMP/local5-desktop-report.json"
+      - name: Preserve synthetic acceptance results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: local5-desktop-report
+          path: ${{ runner.temp }}/local5-desktop-report.json
+          if-no-files-found: ignore
+          retention-days: 7

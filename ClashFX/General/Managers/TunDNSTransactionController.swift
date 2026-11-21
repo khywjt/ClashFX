@@ -66,6 +66,25 @@ enum EnhancedDNSProbeTargetPolicy {
 /// One wall-clock budget covers connect, partial writes and fragmented reads.
 /// In particular, SO_SNDTIMEO alone does not bound a TCP connect.
 enum BoundedDNSProbe {
+    struct ListenerStatus {
+        let udp: Bool
+        let tcp: Bool
+
+        var ready: Bool { udp && tcp }
+    }
+
+    // A STATUS reply proves packet delivery without resolving a public name.
+    // The standalone listener and the TUN DNS relay can use different RCODEs.
+    static func listenerStatus(host: String, port: Int) -> ListenerStatus {
+        func responds(type: Int32) -> Bool {
+            let transactionID = UInt16.random(in: UInt16.min ... UInt16.max)
+            let payload = EnhancedModeDNSReadinessPolicy.listenerStatusQuery(transactionID: transactionID)
+            guard let reply = query(host: host, port: port, type: type, payload: payload) else { return false }
+            return EnhancedModeDNSReadinessPolicy.isListenerStatusResponse(reply, transactionID: transactionID)
+        }
+        return ListenerStatus(udp: responds(type: SOCK_DGRAM), tcp: responds(type: SOCK_STREAM))
+    }
+
     static func query(host: String, port: Int, type: Int32, payload: [UInt8],
                       timeout: TimeInterval = 0.6) -> Data? {
         guard (1 ... 65535).contains(port), timeout > 0 else { return nil }
