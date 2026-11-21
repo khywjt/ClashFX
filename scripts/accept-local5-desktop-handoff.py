@@ -85,7 +85,7 @@ def api(path):
 def profile(expected_dns):
     # The TUN core hijacks both transports at each listed address, regardless of
     # the scheme. Exercise a real DNS handoff failure by moving the TUN DNS peer.
-    address = "198.18.0.1/30" if expected_dns else "198.19.0.1/30"
+    fake_range = "198.18.0.1/16" if expected_dns else "198.19.0.1/16"
     hijack = "198.18.0.2:53" if expected_dns else "198.19.0.2:53"
     reject_unowned = "" if expected_dns else "  - IP-CIDR,198.18.0.2/32,REJECT,no-resolve"
     return f"""mixed-port: {PROXY_PORT}
@@ -102,13 +102,12 @@ tun:
   stack: system
   auto-route: true
   auto-detect-interface: true
-  inet4-address: ["{address}"]
   dns-hijack: ["{hijack}"]
 dns:
   enable: true
   listen: 127.0.0.1:{DNS_PORT}
   enhanced-mode: fake-ip
-  fake-ip-range: 198.18.0.1/16
+  fake-ip-range: {fake_range}
   nameserver: ["1.1.1.1", "8.8.8.8"]
 proxies:
   - {{name: {PIN}, type: socks5, server: 127.0.0.1, port: 9}}
@@ -141,6 +140,7 @@ class Guest:
         self.cursor = {}
         self.inject = False
         self.observed_failure = False
+        self.failed_launch_logs = ""
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), NeutralHealth)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
 
@@ -211,9 +211,13 @@ function run(argv) {
     def ready(self, app):
         actual = version(app)
         if self.inject and actual == upgrade.NEW:
-            wait(lambda: "TUN DNS takeover did not answer on both transports" in since(self.cursor),
-                 145, "real candidate did not reach injected TUN takeover failure")
+            try:
+                wait(lambda: "TUN DNS takeover did not answer on both transports" in since(self.cursor),
+                     90, "real candidate did not reach injected TUN takeover failure")
+            finally:
+                self.failed_launch_logs = since(self.cursor)
             self.observed_failure = True
+            self.report["injectedFailureObserved"] = "tun-dns-takeover"
             print("Actual candidate reported failed TUN DNS takeover", flush=True)
             upgrade.wait_ready(app, timeout=4)
             raise AssertionError("production readiness verifier accepted failed TUN")
@@ -340,9 +344,12 @@ def main():
                 assert report["launches"][-1]["version"] == upgrade.OLD
                 report["failedTakeoverRolledBack"] = True
             except BaseException:
-                relevant = [line for line in since(guest.cursor).splitlines()
-                            if re.search(r"(?i)helper|takeover|enhanced mode|verification|readback|runtime configuration", line)]
-                print("\n".join(relevant[-38:]), flush=True)
+                for label, lines in [("Failed candidate", guest.failed_launch_logs),
+                                     ("Latest launch", since(guest.cursor))]:
+                    print(label, flush=True)
+                    relevant = [line for line in lines.splitlines()
+                                if re.search(r"(?i)helper|takeover|enhanced mode|verification|readback|runtime configuration|listener|error", line)]
+                    print("\n".join(relevant[-40:]), flush=True)
                 raise
             finally:
                 guest.cleanup(network)

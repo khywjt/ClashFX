@@ -22,15 +22,26 @@ jobs:
         with:
           fetch-depth: 16
           persist-credentials: false
+      - name: Restore the isolated build fixtures
+        id: desktop-bundles
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ${{ runner.temp }}/local4/ClashFX.app
+            ${{ runner.temp }}/local5/ClashFX.app
+          key: local5-desktop-test-fixtures-v1-${{ runner.arch }}-${{ hashFiles('ClashFX/**', 'ProxyConfigHelper/**', 'ClashFX.xcodeproj/project.pbxproj', 'Podfile.lock', 'Gemfile.lock', 'scripts/fixtures/local4-readiness-log.patch') }}
       - uses: ruby/setup-ruby@v1
+        if: steps.desktop-bundles.outputs.cache-hit != 'true'
         with:
           ruby-version: '3.3'
           bundler-cache: true
       - uses: actions/setup-go@v6
+        if: steps.desktop-bundles.outputs.cache-hit != 'true'
         with:
           go-version: '1.26.1'
           cache-dependency-path: ClashFX/goClash/go.sum
       - name: Parse both desktop source variants before building dependencies
+        if: steps.desktop-bundles.outputs.cache-hit != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -42,6 +53,7 @@ jobs:
           git restore --source="$GITHUB_SHA" -- ClashFX/AppDelegate.swift
           swiftc -frontend -parse ClashFX/AppDelegate.swift
       - name: Prepare the native core and public dependencies
+        if: steps.desktop-bundles.outputs.cache-hit != 'true'
         env:
           GOMAXPROCS: '3'
         shell: bash
@@ -52,6 +64,7 @@ jobs:
           curl --fail --location --retry 3 https://github.com/Dreamacro/maxmind-geoip/releases/latest/download/Country.mmdb |
             gzip > ClashFX/Resources/Country.mmdb.gz
       - name: Build the paired signed local.4 and local.5 Apps
+        if: steps.desktop-bundles.outputs.cache-hit != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -83,6 +96,14 @@ jobs:
           git apply scripts/fixtures/local4-readiness-log.patch
           build_app local4
           git restore --source="$GITHUB_SHA" -- "${files[@]}"
+      - name: Cache runner-built test bundles before fault injection
+        if: steps.desktop-bundles.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ${{ runner.temp }}/local4/ClashFX.app
+            ${{ runner.temp }}/local5/ClashFX.app
+          key: ${{ steps.desktop-bundles.outputs.cache-primary-key }}
       - name: Run real App, Helper, TUN DNS, cold-start recovery and failure rollback
         run: |
           python3 scripts/accept-local5-desktop-handoff.py \
