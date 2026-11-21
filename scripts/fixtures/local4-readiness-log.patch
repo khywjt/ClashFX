@@ -1,0 +1,13 @@
+--- a/ClashFX/AppDelegate.swift
++++ b/ClashFX/AppDelegate.swift
+@@ -6733,6 +6733,10 @@
+                         }
+                         Logger.log(
+                             "External core API/TUN ready but DNS readiness is unconfirmed on port \(context.dnsPort); " +
++                                "ownership=\(ownership), dnsProbe=\(dnsProbe)",
++                            level: .debug
++                        )
++                    } else {
+                         Logger.log("External core API/TUN/interface is not ready", level: .debug)
+                     }
+                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in

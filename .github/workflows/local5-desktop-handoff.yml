@@ -30,10 +30,27 @@ jobs:
         with:
           go-version: '1.26.1'
           cache-dependency-path: ClashFX/goClash/go.sum
-      - name: Prepare dependencies from the public release sources
+      - name: Parse both desktop source variants before building dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          local_four="$(git log --format=%H --grep='test: rebuild local.4 baseline' -1)"
+          test -n "$local_four"
+          git restore --source="$local_four" -- ClashFX/AppDelegate.swift
+          git apply scripts/fixtures/local4-readiness-log.patch
+          swiftc -frontend -parse ClashFX/AppDelegate.swift
+          git restore --source="$GITHUB_SHA" -- ClashFX/AppDelegate.swift
+          swiftc -frontend -parse ClashFX/AppDelegate.swift
+      - name: Prepare the native core and public dependencies
         env:
           GOMAXPROCS: '3'
-        run: bash install_dependency.sh
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd ClashFX/goClash && python3 build_clash_universal.py --native)
+          bundle exec pod install
+          curl --fail --location --retry 3 https://github.com/Dreamacro/maxmind-geoip/releases/latest/download/Country.mmdb |
+            gzip > ClashFX/Resources/Country.mmdb.gz
       - name: Build the paired signed local.4 and local.5 Apps
         shell: bash
         run: |
@@ -63,6 +80,7 @@ jobs:
           local_four="$(git log --format=%H --grep='test: rebuild local.4 baseline' -1)"
           test -n "$local_four"
           git restore --source="$local_four" -- "${files[@]}"
+          git apply scripts/fixtures/local4-readiness-log.patch
           build_app local4
           git restore --source="$GITHUB_SHA" -- "${files[@]}"
       - name: Run real App, Helper, TUN DNS, cold-start recovery and failure rollback
